@@ -1,0 +1,7 @@
+# Local camera credentials and runtime output
+camera_sources.local.json
+*.out.log
+*.err.log
+__pycache__/
+*.pyc
+*.mp4

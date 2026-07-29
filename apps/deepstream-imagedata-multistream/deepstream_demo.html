@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Video Wall · DeepStream</title>
+  <style>
+    :root{color-scheme:dark;--bg:#05070b;--panel:#0d131c;--line:#243043;--muted:#91a0b4;--blue:#397ff6;--green:#39d6a2;--red:#ff6678}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:#f5f7fb;font-family:Tahoma,Arial,sans-serif}
+    header{display:flex;justify-content:space-between;align-items:center;padding:14px 22px;border-bottom:1px solid var(--line);background:#080c12}
+    h1{margin:0;font-size:18px}.status{color:var(--muted);font-size:12px}
+    main{max-width:1800px;margin:auto;padding:18px}.summary{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+    .wall{position:relative;aspect-ratio:16/9;border:1px solid var(--line);border-radius:14px;overflow:hidden;background:#000}
+    iframe{width:100%;height:100%;border:0}.badge{position:absolute;top:10px;z-index:2;padding:7px 10px;border-radius:8px;background:#000c;font:700 11px Arial}
+    #wall-fps{left:10px;color:#a9c8ff}.encoder{right:10px;color:#8df0cb}
+    .tile-grid{position:absolute;inset:0;z-index:3;display:grid;grid-template-columns:repeat(6,1fr);grid-template-rows:repeat(4,1fr);direction:ltr}
+    .tile-hit{position:relative;border:1px solid #ffffff35;background:transparent;color:#fff;cursor:pointer}
+    .tile-hit:hover{border-color:#6da5ff;box-shadow:inset 0 0 0 2px #397ff688}
+    .tile-hit.offline{background:#21070a99;border-color:#ff667888;cursor:not-allowed}
+    .tile-label{position:absolute;left:5px;bottom:5px;max-width:calc(100% - 10px);padding:3px 5px;border-radius:4px;background:#000b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:700 9px Arial}
+    .sources{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:9px;margin-top:14px}
+    .source{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--panel)}
+    .source.offline{border-color:#74343d}.source strong,.source span{display:block}.source span{margin-top:4px;color:var(--muted);font:11px Arial;direction:ltr}
+    button{padding:9px 11px;border:0;border-radius:8px;background:var(--blue);color:#fff;font-weight:700;cursor:pointer}button:disabled{opacity:.35;cursor:not-allowed}
+    #fullscreen{display:none;position:fixed;inset:0;z-index:50;background:#000;flex-direction:column}
+    #fullscreen .player{flex:1;min-height:0}#fullscreen footer{display:flex;justify-content:space-between;align-items:center;padding:10px 15px;background:#090d13}
+  </style>
+</head>
+<body>
+  <header><h1>دیوار ۲۴ منبع DeepStream</h1><div class="status" id="system-status">در حال اتصال…</div></header>
+  <main>
+    <div class="summary"><strong>Wall 6×4 · 1920×1080 · 12 FPS</strong><span id="online-count">—</span></div>
+    <section class="wall">
+      <iframe id="wall-player" title="Video Wall" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe>
+      <span class="badge" id="wall-fps">WALL 0.0 FPS</span><span class="badge encoder">1× NVENC</span>
+      <div class="tile-grid" id="tile-grid"></div>
+    </section>
+    <section class="sources" id="sources"></section>
+  </main>
+  <section id="fullscreen">
+    <div class="player"><iframe id="fullscreen-player" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe></div>
+    <footer><div><strong id="fullscreen-title">Fullscreen</strong><div class="status" id="fullscreen-fps">0.0 FPS</div></div><button id="close-fullscreen">بستن</button></footer>
+  </section>
+  <script>
+    const state={cameras:[],runtime:new Map()};
+    const streamUrl=id=>`http://${location.hostname}:8889/${encodeURIComponent(id)}?controls=true&muted=true&autoplay=true&playsInline=true`;
+    async function openFullscreen(camera){
+      const item=state.runtime.get(camera.camera_id);if(!item?.online)return;
+      document.getElementById("fullscreen-title").textContent=`${camera.name} · ${item.width}×${item.height}`;
+      const view=document.getElementById("fullscreen");view.style.display="flex";
+      const player=document.getElementById("fullscreen-player");
+      player.src="about:blank";
+      document.getElementById("fullscreen-fps").textContent="در حال اتصال زنده…";
+      const start=await fetch("/api/fullscreen/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({camera_id:camera.camera_id})});
+      if(!start.ok){view.style.display="none";throw new Error("Fullscreen stream آماده نشد");}
+      player.src=`${streamUrl("fullscreen")}&session=${Date.now()}`;
+    }
+    async function closeFullscreen(){
+      document.getElementById("fullscreen-player").src="about:blank";
+      await fetch("/api/fullscreen/stop",{method:"POST"});
+      document.getElementById("fullscreen").style.display="none";
+    }
+    function render(){
+      document.getElementById("tile-grid").replaceChildren(...state.cameras.map((camera,index)=>{
+        const tile=document.createElement("button");tile.className="tile-hit";tile.dataset.id=camera.camera_id;
+        const label=document.createElement("span");label.className="tile-label";label.textContent=`${index+1} · ${camera.camera_id}`;
+        tile.append(label);tile.onclick=()=>openFullscreen(camera);return tile;
+      }));
+      document.getElementById("sources").replaceChildren(...state.cameras.map((camera,index)=>{
+        const card=document.createElement("article");card.className="source";card.dataset.id=camera.camera_id;
+        const info=document.createElement("div"),title=document.createElement("strong"),detail=document.createElement("span"),button=document.createElement("button");
+        title.textContent=`${index+1}. ${camera.name}`;detail.textContent=camera.camera_id;detail.dataset.role="detail";
+        button.textContent="Fullscreen";button.onclick=()=>openFullscreen(camera);
+        info.append(title,detail);card.append(info,button);return card;
+      }));
+    }
+    function applyRuntime(payload){
+      state.runtime=new Map(payload.sources.map(item=>[item.camera_id,item]));let online=0;
+      document.querySelectorAll(".source").forEach(card=>{
+        const item=state.runtime.get(card.dataset.id);if(!item)return;if(item.online)online++;
+        card.classList.toggle("offline",!item.online);card.querySelector("button").disabled=!item.online;
+        const res=item.width&&item.height?`${item.width}×${item.height}`:"NO FRAME";
+        card.querySelector('[data-role="detail"]').textContent=`${item.camera_id} · tile ${item.source_index} · gen ${item.generation} · ${res} · ${Number(item.fps).toFixed(1)} FPS`;
+      });
+      document.querySelectorAll(".tile-hit").forEach(tile=>{
+        const item=state.runtime.get(tile.dataset.id);tile.disabled=!item?.online;tile.classList.toggle("offline",!item?.online);
+        const label=tile.querySelector(".tile-label");if(item)label.textContent=`${tile.dataset.id} · ${Number(item.fps).toFixed(1)}`;
+      });
+      document.getElementById("online-count").textContent=`${online}/${state.cameras.length} online`;
+      document.getElementById("wall-fps").textContent=`WALL ${Number(payload.wall_fps).toFixed(1)} FPS`;
+      document.getElementById("fullscreen-fps").textContent=`${Number(payload.fullscreen?.fps||0).toFixed(1)} FPS · NVENC ${payload.total_nvenc_sessions||1}/2`;
+      document.getElementById("system-status").textContent=`${online} NVDEC sources · ${payload.total_nvenc_sessions||1} NVENC`;
+    }
+    async function refresh(){const response=await fetch("/api/runtime",{cache:"no-store"});applyRuntime(await response.json())}
+    async function boot(){
+      const response=await fetch("/api/cameras",{cache:"no-store"});state.cameras=await response.json();render();
+      document.getElementById("wall-player").src=streamUrl("deepstream-mosaic");
+      document.getElementById("close-fullscreen").onclick=closeFullscreen;
+      await refresh();setInterval(refresh,1000);
+    }
+    boot().catch(error=>document.getElementById("system-status").textContent=`خطا: ${error.message}`);
+  </script>
+</body>
+</html>

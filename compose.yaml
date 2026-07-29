@@ -1,0 +1,74 @@
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:1.18.2
+    restart: unless-stopped
+    ports:
+      # The containers use mediamtx:8554. Host port 8555 avoids colliding
+      # with older DeepStream containers that were started with -p 8554:8554.
+      - "8555:8554"
+      - "8889:8889"
+      # 8189 is already used by another MediaMTX instance on this host.
+      - "8190:8190/udp"
+    environment:
+      # Change this to the server's LAN IP when viewing from another machine.
+      MTX_WEBRTCADDITIONALHOSTS: "${WEBRTC_ADDITIONAL_HOSTS:-127.0.0.1}"
+      MTX_WEBRTCLOCALUDPADDRESS: ":8190"
+
+  deepstream:
+    build:
+      context: .
+    image: deepstream-camera-wall:ds71
+    gpus: all
+    ipc: host
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      RTSP_CAMERA_LIMIT: "8"
+      RTSP_CAMERA_COPIES: "3"
+      RTSP_SHARED_INGEST: "false"
+      STATIC_CAMERA_LIMIT: "0"
+      STATIC_CAMERA_SOURCE_COUNT: "0"
+      STATIC_CAMERA_EMULATION: "false"
+      STATIC_CAMERA_PASSTHROUGH: "false"
+      VIDEO_ONLY_MODE: "true"
+      AI_ENABLED: "false"
+      AI_STREAM_ENABLED: "false"
+      AI_OVERLAY_ENABLED: "false"
+      JPEG_ENABLED: "false"
+      CPU_PRESENTATION_ENABLED: "false"
+      MOSAIC_PUBLISH_ENABLED: "true"
+      INDIVIDUAL_STREAMS_ENABLED: "false"
+      WALL_COLUMNS: "6"
+      WALL_ROWS: "4"
+      WALL_TARGET_FPS: "12"
+      FULLSCREEN_OUTPUT_WIDTH: "2944"
+      FULLSCREEN_OUTPUT_HEIGHT: "1664"
+      INDIVIDUAL_OUTPUT_WIDTH: "1280"
+      INDIVIDUAL_OUTPUT_HEIGHT: "720"
+      BENCHMARK_PIPELINE_MODE: "full"
+      BENCHMARK_STATIC_ONLY: "false"
+    depends_on:
+      - mediamtx
+    working_dir: /workspace/apps/deepstream-imagedata-multistream
+    ports:
+      - "7071:7070"
+    volumes:
+      - .:/workspace
+    command:
+      - python3
+      - deepstream_low_latency_rtsp_and_file.py
+      - --publish-url
+      - rtsp://mediamtx:8554/deepstream-mosaic
+      - --camera-config
+      - /workspace/camera_sources.local.json
+      - --transport
+      - tcp
+      - --rtsp-latency
+      - "120"
+      - --output-width
+      - "1920"
+      - --output-height
+      - "1080"
+      - --bitrate
+      - "8000000"
+      - --web-port
+      - "7070"
