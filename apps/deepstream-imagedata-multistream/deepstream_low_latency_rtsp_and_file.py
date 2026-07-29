@@ -101,8 +101,38 @@ class LowLatencyDeepStreamPublisher:
         self.loop: GLib.MainLoop | None = None
         self.streammux: Gst.Element | None = None
         self._source_tees: dict[int, Gst.Element] = {}
+        self._fullscreen_source_tees: dict[int, Gst.Element] = {}
+        self._demux_request_pads: list[Gst.Pad] = []
         self._fullscreen_branch: dict[str, Any] | None = None
         self._fullscreen_lock = threading.Lock()
+        self._fullscreen_state = "IDLE"
+        self._fullscreen_overlay_requested: bool | None = None
+        self._fullscreen_operation_id = 0
+        self._fullscreen_metrics = {
+            "fullscreen_create_requests": 0,
+            "fullscreen_create_success": 0,
+            "fullscreen_create_failures": 0,
+            "fullscreen_destroy_requests": 0,
+            "fullscreen_destroy_success": 0,
+            "fullscreen_destroy_failures": 0,
+            "fullscreen_switch_requests": 0,
+            "fullscreen_operation_timeouts": 0,
+            "fullscreen_stale_callbacks_ignored": 0,
+            "fullscreen_overlay_frames": 0,
+            "fullscreen_overlay_metadata_missing": 0,
+            "fullscreen_encoder_create_count": 0,
+            "fullscreen_encoder_reuse_count": 0,
+            "fullscreen_encoder_recreate_count": 0,
+            "fullscreen_first_buffer_timeout": 0,
+            "fullscreen_zero_fps_events": 0,
+            "fullscreen_source_switch_count": 0,
+            "fullscreen_stale_frames_dropped": 0,
+            "overlay_bbox_transform_count": 0,
+            "overlay_bbox_transform_errors": 0,
+            "overlay_bbox_clamped_count": 0,
+            "overlay_coordinate_space_mismatch": 0,
+            "overlay_metadata_copy_failures": 0,
+        }
         self._requested_mux_pads: list[Gst.Pad] = []
         self._web_server: Any = None
         self._web_thread: threading.Thread | None = None
@@ -487,6 +517,11 @@ class LowLatencyDeepStreamPublisher:
                 stats["fps"] = stats["window_frames"] / elapsed
                 stats["window_frames"] = 0
                 stats["window_started"] = now
+        if (
+            self._fullscreen_branch is not None
+            and self._fullscreen_branch.get("overlay_enabled")
+        ):
+            self._fullscreen_metrics["fullscreen_overlay_frames"] += 1
         return Gst.PadProbeReturn.OK
 
     def _fullscreen_retimestamp_probe(
@@ -530,10 +565,24 @@ class LowLatencyDeepStreamPublisher:
         self._last_wall_buffer_at = now
         return Gst.PadProbeReturn.OK
 
+    def _set_fullscreen_overlay(self, enabled: bool) -> bool:
+        branch = self._fullscreen_branch
+        if branch is None:
+            return False
+        for element in branch["elements"]:
+            if element.get_name() == "fullscreen-osd":
+                self._set_if_supported(element, "display-bbox", enabled)
+                self._set_if_supported(element, "display-text", enabled)
+                branch["overlay_enabled"] = enabled
+                break
+        return False
+
     def _stop_fullscreen_branch(self) -> bool:
+        self._fullscreen_state = "STOPPING"
         with self._fullscreen_lock:
             branch = self._fullscreen_branch
             if branch is None or self.pipeline is None:
+                self._fullscreen_state = "STOPPED"
                 return False
             tee_pad = branch["tee_pad"]
             queue = branch["elements"][0]
@@ -545,6 +594,8 @@ class LowLatencyDeepStreamPublisher:
                 element.set_state(Gst.State.NULL)
                 self.pipeline.remove(element)
             self._fullscreen_branch = None
+            self._fullscreen_state = "STOPPED"
+            self._fullscreen_metrics["fullscreen_destroy_success"] += 1
             with self._fps_lock:
                 self._fullscreen_stats.update(
                     {
@@ -564,9 +615,15 @@ class LowLatencyDeepStreamPublisher:
     ) -> bool:
         if self.pipeline is None:
             return False
-        tee = self._source_tees.get(source_index)
+        self._fullscreen_state = "CREATING"
+        tee = self._fullscreen_source_tees.get(source_index)
         if tee is None:
+            self._fullscreen_state = "FAILED"
+            self._fullscreen_metrics["fullscreen_create_failures"] += 1
             return False
+        if self._fullscreen_branch is not None:
+            self._fullscreen_metrics["fullscreen_switch_requests"] += 1
+            self._stop_fullscreen_branch()
         with self._fullscreen_lock:
             branch = self._fullscreen_branch
             if branch is not None:
@@ -603,7 +660,12 @@ class LowLatencyDeepStreamPublisher:
                 return False
 
         queue = self._make("queue", "fullscreen-queue")
-        converter = self._make("nvvideoconvert", "fullscreen-converter")
+        converter = self._make("nvvideoconvert", "fullscreen-rgba-converter")
+        rgba_caps = self._make("capsfilter", "fullscreen-rgba-caps")
+        fullscreen_osd = self._make("nvdsosd", "fullscreen-osd")
+        nv12_converter = self._make(
+            "nvvideoconvert", "fullscreen-nv12-converter"
+        )
         capsfilter = self._make("capsfilter", "fullscreen-nv12-caps")
         rate = self._make("videorate", "fullscreen-rate")
         rate_caps = self._make(
@@ -616,6 +678,28 @@ class LowLatencyDeepStreamPublisher:
         self._set_if_supported(converter, "gpu-id", self.settings.gpu_id)
         self._set_if_supported(
             converter, "nvbuf-memory-type", NVBUF_MEM_CUDA_DEVICE
+        )
+        self._set_if_supported(
+            nv12_converter, "nvbuf-memory-type", NVBUF_MEM_CUDA_DEVICE
+        )
+        self._set_if_supported(
+            nv12_converter, "gpu-id", self.settings.gpu_id
+        )
+        rgba_caps.set_property(
+            "caps",
+            Gst.Caps.from_string("video/x-raw(memory:NVMM),format=RGBA"),
+        )
+        overlay_enabled = self._overlay_per_camera.get(camera_id)
+        if overlay_enabled is None:
+            overlay_enabled = self._overlay_global
+        if self._fullscreen_overlay_requested is not None:
+            overlay_enabled = self._fullscreen_overlay_requested
+        self._set_if_supported(fullscreen_osd, "process-mode", 1)
+        self._set_if_supported(
+            fullscreen_osd, "display-bbox", bool(overlay_enabled)
+        )
+        self._set_if_supported(
+            fullscreen_osd, "display-text", bool(overlay_enabled)
         )
         capsfilter.set_property(
             "caps",
@@ -651,6 +735,9 @@ class LowLatencyDeepStreamPublisher:
         elements = [
             queue,
             converter,
+            rgba_caps,
+            fullscreen_osd,
+            nv12_converter,
             capsfilter,
             rate,
             rate_caps,
@@ -706,7 +793,9 @@ class LowLatencyDeepStreamPublisher:
                 "tee": tee,
                 "tee_pad": tee_pad,
                 "elements": elements,
+                "overlay_enabled": bool(overlay_enabled),
             }
+            self._fullscreen_state = "ACTIVE"
         return False
 
     def _start_frontend(self) -> None:
@@ -806,6 +895,20 @@ class LowLatencyDeepStreamPublisher:
                         "frames": int(self._fullscreen_stats["frames"]),
                         "active": self._fullscreen_branch is not None,
                     },
+                    "fullscreen_controller": {
+                        "state": self._fullscreen_state,
+                        "operation_id": self._fullscreen_operation_id,
+                        **self._fullscreen_metrics,
+                        "fullscreen_active_sessions": (
+                            1 if self._fullscreen_branch else 0
+                        ),
+                        "fullscreen_encoder_sessions": (
+                            1 if self._fullscreen_branch else 0
+                        ),
+                        "fullscreen_request_pads_active": (
+                            1 if self._fullscreen_branch else 0
+                        ),
+                    },
                     "wall_nvenc_sessions": 1,
                     "total_nvenc_sessions": (
                         2 if self._fullscreen_branch is not None else 1
@@ -847,6 +950,7 @@ class LowLatencyDeepStreamPublisher:
                 }
             )
 
+        @app.post("/api/overlay")
         @app.put("/api/overlay")
         def overlay_put() -> Any:
             payload = request.get_json(silent=True) or {}
@@ -864,6 +968,11 @@ class LowLatencyDeepStreamPublisher:
                 value = payload.get("camera_overlay_enabled")
                 self._overlay_per_camera[str(camera_id)] = (
                     None if value is None else bool(value)
+                )
+            if "fullscreen_overlay_enabled" in payload:
+                GLib.idle_add(
+                    self._set_fullscreen_overlay,
+                    bool(payload["fullscreen_overlay_enabled"]),
                 )
             return overlay_get()
 
@@ -901,11 +1010,18 @@ class LowLatencyDeepStreamPublisher:
                 jsonify({"error": "event not found"}), 404
             )
 
+        @app.post("/api/fullscreen/switch")
+        @app.post("/api/fullscreen/open")
         @app.post("/api/fullscreen/start")
         def fullscreen_start() -> Any:
             self._overlay_stats["fullscreen_requests_total"] += 1
+            self._fullscreen_metrics["fullscreen_create_requests"] += 1
+            self._fullscreen_operation_id += 1
+            operation_id = self._fullscreen_operation_id
             payload = request.get_json(silent=True) or {}
-            camera_id = str(payload.get("camera_id", ""))
+            camera_id = str(
+                payload.get("source_id", payload.get("camera_id", ""))
+            )
             camera = next(
                 (
                     item
@@ -919,6 +1035,13 @@ class LowLatencyDeepStreamPublisher:
             now = time.monotonic()
             with self._fps_lock:
                 source_stats = self._source_stats[int(camera["source_index"])]
+                requested_generation = payload.get("generation")
+                if (
+                    requested_generation is not None
+                    and int(requested_generation)
+                    != int(source_stats["generation"])
+                ):
+                    return {"error": "stale_generation"}, 409
                 if (
                     source_stats["last_frame_at"] <= 0
                     or now - source_stats["last_frame_at"] >= 3.0
@@ -926,6 +1049,11 @@ class LowLatencyDeepStreamPublisher:
                     self._overlay_stats["fullscreen_route_failures"] += 1
                     return {"error": "camera offline"}, 409
             actual_camera_id = str(camera["camera_id"])
+            self._fullscreen_overlay_requested = (
+                bool(payload["overlay_enabled"])
+                if "overlay_enabled" in payload
+                else None
+            )
             GLib.idle_add(
                 self._start_fullscreen_branch,
                 actual_camera_id,
@@ -940,6 +1068,9 @@ class LowLatencyDeepStreamPublisher:
                         and self._fullscreen_stats["frames"] >= 2
                     )
                 if ready:
+                    self._fullscreen_metrics[
+                        "fullscreen_create_success"
+                    ] += 1
                     return {
                         "status": "ready",
                         "camera_id": actual_camera_id,
@@ -947,16 +1078,28 @@ class LowLatencyDeepStreamPublisher:
                         "stream_path": self._fullscreen_stats.get(
                             "stream_path", "fullscreen"
                         ),
+                        "operation_id": operation_id,
                     }
                 time.sleep(0.1)
+            self._fullscreen_metrics["fullscreen_create_failures"] += 1
+            self._fullscreen_metrics["fullscreen_operation_timeouts"] += 1
+            GLib.idle_add(self._stop_fullscreen_branch)
+            cleanup_deadline = time.monotonic() + 4.0
+            while (
+                self._fullscreen_branch is not None
+                and time.monotonic() < cleanup_deadline
+            ):
+                time.sleep(0.05)
             return {
                 "error": "fullscreen stream did not become ready",
                 "camera_id": actual_camera_id,
                 "requested_camera_id": camera_id,
             }, 504
 
+        @app.post("/api/fullscreen/close")
         @app.post("/api/fullscreen/stop")
         def fullscreen_stop() -> Any:
+            self._fullscreen_metrics["fullscreen_destroy_requests"] += 1
             GLib.idle_add(self._stop_fullscreen_branch)
             deadline = time.monotonic() + 4.0
             while (
@@ -967,6 +1110,33 @@ class LowLatencyDeepStreamPublisher:
             if self._fullscreen_branch is not None:
                 return {"error": "fullscreen release timeout"}, 504
             return {"status": "stopped", "encoder": "released"}, 200
+
+        @app.get("/api/fullscreen/status")
+        def fullscreen_status() -> Any:
+            branch = self._fullscreen_branch
+            camera_id = (
+                str(branch["camera_id"]) if branch is not None else None
+            )
+            generation = None
+            if camera_id is not None:
+                camera = next(
+                    item for item in self.settings.cameras
+                    if item["camera_id"] == camera_id
+                )
+                generation = self._source_stats[
+                    int(camera["source_index"])
+                ]["generation"]
+            return {
+                "state": self._fullscreen_state,
+                "source_id": camera_id,
+                "generation": generation,
+                "operation_id": self._fullscreen_operation_id,
+                "overlay_enabled": (
+                    branch.get("overlay_enabled") if branch else None
+                ),
+                "encoder_active": branch is not None,
+                "publisher_active": branch is not None,
+            }
 
         @app.get("/health")
         def health() -> Any:
@@ -1895,6 +2065,60 @@ class LowLatencyDeepStreamPublisher:
                 self._ai_metadata_probe,
             )
             analytics_tail = tracker
+
+        if self._ai_enabled:
+            batch_tee = self._make("tee", "post-tracker-batch-tee")
+            wall_batch_queue = self._make("queue", "wall-batch-queue")
+            demux_queue = self._make("queue", "fullscreen-demux-queue")
+            demux = self._make("nvstreamdemux", "tracked-source-demux")
+            self._configure_leaky_queue(wall_batch_queue)
+            self._configure_leaky_queue(demux_queue)
+            for element in (
+                batch_tee, wall_batch_queue, demux_queue, demux
+            ):
+                pipeline.add(element)
+            if not analytics_tail.link(batch_tee):
+                raise RuntimeError("Could not link tracker to batch tee")
+            if not batch_tee.link(wall_batch_queue):
+                raise RuntimeError("Could not link batch tee to Wall")
+            if not batch_tee.link(demux_queue) or not demux_queue.link(demux):
+                raise RuntimeError("Could not link tracked demux branch")
+            analytics_tail = wall_batch_queue
+
+            for source_index in range(number_sources):
+                source_tee = self._make(
+                    "tee", f"tracked-source-tee-{source_index:02d}"
+                )
+                idle_queue = self._make(
+                    "queue", f"tracked-idle-queue-{source_index:02d}"
+                )
+                idle_sink = self._make(
+                    "fakesink", f"tracked-idle-sink-{source_index:02d}"
+                )
+                self._configure_leaky_queue(idle_queue)
+                self._set_if_supported(idle_sink, "sync", False)
+                self._set_if_supported(idle_sink, "async", False)
+                pipeline.add(source_tee)
+                pipeline.add(idle_queue)
+                pipeline.add(idle_sink)
+                if not source_tee.link(idle_queue) or not idle_queue.link(
+                    idle_sink
+                ):
+                    raise RuntimeError("Could not link tracked idle branch")
+                demux_pad = self._request_pad(
+                    demux, f"src_{source_index}"
+                )
+                tee_sink = source_tee.get_static_pad("sink")
+                if (
+                    demux_pad is None
+                    or tee_sink is None
+                    or demux_pad.link(tee_sink) != Gst.PadLinkReturn.OK
+                ):
+                    raise RuntimeError(
+                        f"Could not map demux source {source_index}"
+                    )
+                self._demux_request_pads.append(demux_pad)
+                self._fullscreen_source_tees[source_index] = source_tee
 
         # Build source tees. One GPU-memory branch feeds analytics/mosaic and
         # the native surface remains available for on-demand fullscreen.

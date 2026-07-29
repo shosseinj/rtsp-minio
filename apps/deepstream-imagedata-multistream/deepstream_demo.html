@@ -39,27 +39,31 @@
   </main>
   <section id="fullscreen">
     <div class="player"><iframe id="fullscreen-player" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe></div>
-    <footer><div><strong id="fullscreen-title">Fullscreen</strong><div class="status" id="fullscreen-fps">0.0 FPS</div></div><button id="close-fullscreen">بستن</button></footer>
+    <footer><div><strong id="fullscreen-title">Fullscreen</strong><div class="status" id="fullscreen-fps">0.0 FPS</div></div><label><input id="fullscreen-overlay" type="checkbox" checked> Overlay</label><button id="close-fullscreen">بستن</button></footer>
   </section>
   <script>
-    const state={cameras:[],runtime:new Map()};
+    const state={cameras:[],runtime:new Map(),fullscreenBusy:false};
     const streamUrl=id=>`http://${location.hostname}:8889/${encodeURIComponent(id)}?controls=true&muted=true&autoplay=true&playsInline=true`;
     async function openFullscreen(camera){
-      const item=state.runtime.get(camera.camera_id);if(!item?.online)return;
+      const item=state.runtime.get(camera.camera_id);if(!item?.online||state.fullscreenBusy)return;
+      state.fullscreenBusy=true;
       document.getElementById("fullscreen-title").textContent=`${camera.name} · ${item.width}×${item.height}`;
       const view=document.getElementById("fullscreen");view.style.display="flex";
       const player=document.getElementById("fullscreen-player");
       player.src="about:blank";
       document.getElementById("fullscreen-fps").textContent="در حال اتصال زنده…";
-      const start=await fetch("/api/fullscreen/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({camera_id:camera.camera_id})});
-      if(!start.ok){view.style.display="none";throw new Error("Fullscreen stream آماده نشد");}
+      const start=await fetch("/api/fullscreen/open",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({source_id:camera.camera_id,generation:item.generation,overlay_enabled:document.getElementById("fullscreen-overlay").checked})});
+      if(!start.ok){view.style.display="none";state.fullscreenBusy=false;throw new Error((await start.json()).error||"Fullscreen stream آماده نشد");}
       const ready=await start.json();
       player.src=`${streamUrl(ready.stream_path)}&session=${Date.now()}`;
+      state.fullscreenBusy=false;
     }
     async function closeFullscreen(){
+      if(state.fullscreenBusy)return;state.fullscreenBusy=true;
       document.getElementById("fullscreen-player").src="about:blank";
-      await fetch("/api/fullscreen/stop",{method:"POST"});
+      await fetch("/api/fullscreen/close",{method:"POST"});
       document.getElementById("fullscreen").style.display="none";
+      state.fullscreenBusy=false;
     }
     function render(){
       document.getElementById("tile-grid").replaceChildren(...state.cameras.map((camera,index)=>{
@@ -103,6 +107,7 @@
       toggle.onchange=()=>setOverlay(toggle.checked);
       document.getElementById("wall-player").src=streamUrl("deepstream-mosaic");
       document.getElementById("close-fullscreen").onclick=closeFullscreen;
+      document.getElementById("fullscreen-overlay").onchange=event=>fetch("/api/overlay",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({fullscreen_overlay_enabled:event.target.checked})});
       await refresh();setInterval(refresh,1000);
     }
     boot().catch(error=>document.getElementById("system-status").textContent=`خطا: ${error.message}`);

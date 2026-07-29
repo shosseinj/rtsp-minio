@@ -90,6 +90,10 @@ services:
       - "1920"
       - --output-height
       - "1080"
+      - --mux-width
+      - "2944"
+      - --mux-height
+      - "1664"
       - --bitrate
       - "8000000"
       - --web-port
