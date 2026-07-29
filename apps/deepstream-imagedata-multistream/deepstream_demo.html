@@ -27,7 +27,7 @@
   </style>
 </head>
 <body>
-  <header><h1>دیوار ۲۴ منبع DeepStream</h1><div class="status" id="system-status">در حال اتصال…</div></header>
+  <header><h1>دیوار ۲۴ منبع DeepStream</h1><label><input id="overlay-toggle" type="checkbox"> نمایش تشخیص و Track ID</label><div class="status" id="system-status">در حال اتصال…</div></header>
   <main>
     <div class="summary"><strong>Wall 6×4 · 1920×1080 · 12 FPS</strong><span id="online-count">—</span></div>
     <section class="wall">
@@ -53,7 +53,8 @@
       document.getElementById("fullscreen-fps").textContent="در حال اتصال زنده…";
       const start=await fetch("/api/fullscreen/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({camera_id:camera.camera_id})});
       if(!start.ok){view.style.display="none";throw new Error("Fullscreen stream آماده نشد");}
-      player.src=`${streamUrl("fullscreen")}&session=${Date.now()}`;
+      const ready=await start.json();
+      player.src=`${streamUrl(ready.stream_path)}&session=${Date.now()}`;
     }
     async function closeFullscreen(){
       document.getElementById("fullscreen-player").src="about:blank";
@@ -92,8 +93,14 @@
       document.getElementById("system-status").textContent=`${online} NVDEC sources · ${payload.total_nvenc_sessions||1} NVENC`;
     }
     async function refresh(){const response=await fetch("/api/runtime",{cache:"no-store"});applyRuntime(await response.json())}
+    async function setOverlay(enabled){
+      await fetch("/api/overlay",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({global_overlay_enabled:enabled})});
+    }
     async function boot(){
       const response=await fetch("/api/cameras",{cache:"no-store"});state.cameras=await response.json();render();
+      const overlay=await (await fetch("/api/overlay",{cache:"no-store"})).json();
+      const toggle=document.getElementById("overlay-toggle");toggle.checked=overlay.global_overlay_enabled;
+      toggle.onchange=()=>setOverlay(toggle.checked);
       document.getElementById("wall-player").src=streamUrl("deepstream-mosaic");
       document.getElementById("close-fullscreen").onclick=closeFullscreen;
       await refresh();setInterval(refresh,1000);

@@ -37,11 +37,14 @@ from __future__ import annotations
 import argparse
 import configparser
 import ctypes
+import datetime as dt
 import json
 import math
 import os
+import queue
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -109,6 +112,7 @@ class LowLatencyDeepStreamPublisher:
         self._file_publisher_threads: list[threading.Thread] = []
         self._fps_lock = threading.Lock()
         now = time.monotonic()
+        generation_seed = int(time.time() * 1000)
         self._source_stats: dict[int, dict[str, Any]] = {
             index: {
                 "frames": 0,
@@ -120,7 +124,7 @@ class LowLatencyDeepStreamPublisher:
                 "last_frame_at": 0.0,
                 "last_pts": -1,
                 "loop_count": 0,
-                "generation": 1,
+                "generation": generation_seed,
                 "generation_changes": 0,
             }
             for index in range(len(settings.uris))
@@ -162,6 +166,36 @@ class LowLatencyDeepStreamPublisher:
             "person_inference_fps": 0.0,
         }
         self._person_tracks: dict[tuple[int, int, int], dict[str, Any]] = {}
+        self._finalized_track_keys: set[tuple[str, int, int]] = set()
+        self._overlay_global = os.getenv(
+            "AI_OVERLAY_DEFAULT_ENABLED", "true"
+        ).lower() in {"1", "true", "yes", "on"}
+        self._overlay_per_camera: dict[str, bool | None] = {}
+        self._overlay_stats = {
+            "overlay_frames_rendered": 0,
+            "overlay_render_errors": 0,
+            "fullscreen_requests_total": 0,
+            "fullscreen_route_failures": 0,
+            "fullscreen_wrong_source_count": 0,
+            "duplicate_track_end_events": 0,
+            "sqlite_events_created": 0,
+            "sqlite_write_failures": 0,
+        }
+        self._event_queue: queue.Queue[dict[str, Any]] = queue.Queue(
+            maxsize=int(os.getenv("EVENT_QUEUE_MAX_SIZE", "1000"))
+        )
+        self._event_db_path = Path(
+            os.getenv(
+                "EVENT_SQLITE_PATH", "/workspace/data/events/events.db"
+            )
+        )
+        self._event_worker_stop = threading.Event()
+        self._event_worker = threading.Thread(
+            target=self._event_db_loop,
+            name="person-event-sqlite",
+            daemon=True,
+        )
+        self._event_worker.start()
         self._outbox_path = Path(
             os.getenv("AI_DURABLE_OUTBOX_PATH", "/workspace/spool/events.jsonl")
         )
@@ -608,9 +642,11 @@ class LowLatencyDeepStreamPublisher:
         self._configure_h264_encoder(encoder, self.settings.bitrate)
         parser.set_property("config-interval", -1)
         parsed = urlsplit(self.settings.publish_url)
-        fullscreen_url = (
-            f"{parsed.scheme}://{parsed.netloc}/fullscreen"
+        stream_path = (
+            f"fullscreen-{camera_id}-"
+            f"{int(self._source_stats[source_index]['generation'])}"
         )
+        fullscreen_url = f"{parsed.scheme}://{parsed.netloc}/{stream_path}"
         self._configure_rtsp_publisher(publisher, fullscreen_url, False)
         elements = [
             queue,
@@ -661,6 +697,7 @@ class LowLatencyDeepStreamPublisher:
                     "frames": 0,
                     "window_frames": 0,
                     "window_started": time.monotonic(),
+                    "stream_path": stream_path,
                 }
             )
         with self._fullscreen_lock:
@@ -787,6 +824,11 @@ class LowLatencyDeepStreamPublisher:
                         for key, value in self._ai_stats.items()
                         if key not in {"window_frames", "window_started"}
                     },
+                    "overlay": {
+                        "overlay_enabled_global": self._overlay_global,
+                        "overlay_enabled_per_camera": self._overlay_per_camera,
+                        **self._overlay_stats,
+                    },
                     "full_frame_cpu_copy_count": self._ai_stats[
                         "full_frame_cpu_copy_count"
                     ],
@@ -796,8 +838,72 @@ class LowLatencyDeepStreamPublisher:
                 }
             )
 
+        @app.get("/api/overlay")
+        def overlay_get() -> Any:
+            return jsonify(
+                {
+                    "global_overlay_enabled": self._overlay_global,
+                    "camera_overrides": self._overlay_per_camera,
+                }
+            )
+
+        @app.put("/api/overlay")
+        def overlay_put() -> Any:
+            payload = request.get_json(silent=True) or {}
+            if "global_overlay_enabled" in payload:
+                self._overlay_global = bool(
+                    payload["global_overlay_enabled"]
+                )
+            camera_id = payload.get("camera_id")
+            if camera_id is not None:
+                if not any(
+                    camera["camera_id"] == camera_id
+                    for camera in self.settings.cameras
+                ):
+                    return {"error": "camera not found"}, 404
+                value = payload.get("camera_overlay_enabled")
+                self._overlay_per_camera[str(camera_id)] = (
+                    None if value is None else bool(value)
+                )
+            return overlay_get()
+
+        @app.get("/api/events")
+        def events_list() -> Any:
+            limit = min(500, max(1, int(request.args.get("limit", 100))))
+            offset = max(0, int(request.args.get("offset", 0)))
+            connection = sqlite3.connect(self._event_db_path)
+            connection.row_factory = sqlite3.Row
+            clauses, values = [], []
+            for field in ("source_id", "status", "track_id"):
+                value = request.args.get(field)
+                if value is not None:
+                    clauses.append(f"{field}=?")
+                    values.append(value)
+            where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+            rows = connection.execute(
+                f"SELECT * FROM person_track_events{where} "
+                "ORDER BY ended_at DESC LIMIT ? OFFSET ?",
+                (*values, limit, offset),
+            ).fetchall()
+            connection.close()
+            return jsonify([dict(row) for row in rows])
+
+        @app.get("/api/events/<event_id>")
+        def event_detail(event_id: str) -> Any:
+            connection = sqlite3.connect(self._event_db_path)
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                "SELECT * FROM person_track_events WHERE event_id=?",
+                (event_id,),
+            ).fetchone()
+            connection.close()
+            return (jsonify(dict(row)), 200) if row else (
+                jsonify({"error": "event not found"}), 404
+            )
+
         @app.post("/api/fullscreen/start")
         def fullscreen_start() -> Any:
+            self._overlay_stats["fullscreen_requests_total"] += 1
             payload = request.get_json(silent=True) or {}
             camera_id = str(payload.get("camera_id", ""))
             camera = next(
@@ -810,41 +916,15 @@ class LowLatencyDeepStreamPublisher:
             )
             if camera is None:
                 return {"error": "camera not found"}, 404
-            physical_id = camera.get(
-                "physical_camera_id", camera["camera_id"]
-            )
-            candidates = [
-                item
-                for item in self.settings.cameras
-                if item.get("physical_camera_id", item["camera_id"])
-                == physical_id
-            ]
             now = time.monotonic()
             with self._fps_lock:
-                online_candidates = [
-                    item
-                    for item in candidates
-                    if (
-                        self._source_stats[int(item["source_index"])][
-                            "last_frame_at"
-                        ] > 0
-                        and now
-                        - self._source_stats[int(item["source_index"])][
-                            "last_frame_at"
-                        ]
-                        < 3.0
-                    )
-                ]
-                if online_candidates:
-                    camera = min(
-                        online_candidates,
-                        key=lambda item: (
-                            self._source_stats[int(item["source_index"])][
-                                "loop_count"
-                            ],
-                            int(item.get("independent_copy", 1)),
-                        ),
-                    )
+                source_stats = self._source_stats[int(camera["source_index"])]
+                if (
+                    source_stats["last_frame_at"] <= 0
+                    or now - source_stats["last_frame_at"] >= 3.0
+                ):
+                    self._overlay_stats["fullscreen_route_failures"] += 1
+                    return {"error": "camera offline"}, 409
             actual_camera_id = str(camera["camera_id"])
             GLib.idle_add(
                 self._start_fullscreen_branch,
@@ -864,7 +944,9 @@ class LowLatencyDeepStreamPublisher:
                         "status": "ready",
                         "camera_id": actual_camera_id,
                         "requested_camera_id": camera_id,
-                        "stream_path": "fullscreen",
+                        "stream_path": self._fullscreen_stats.get(
+                            "stream_path", "fullscreen"
+                        ),
                     }
                 time.sleep(0.1)
             return {
@@ -875,10 +957,16 @@ class LowLatencyDeepStreamPublisher:
 
         @app.post("/api/fullscreen/stop")
         def fullscreen_stop() -> Any:
-            # Keep the single Fullscreen encoder warm. Recreating NVENC
-            # contexts during rapid camera changes causes multi-second gaps;
-            # the warm branch remains within the <=2 session budget.
-            return {"status": "hidden", "encoder": "warm"}, 200
+            GLib.idle_add(self._stop_fullscreen_branch)
+            deadline = time.monotonic() + 4.0
+            while (
+                self._fullscreen_branch is not None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.05)
+            if self._fullscreen_branch is not None:
+                return {"error": "fullscreen release timeout"}, 504
+            return {"status": "stopped", "encoder": "released"}, 200
 
         @app.get("/health")
         def health() -> Any:
@@ -1125,6 +1213,14 @@ class LowLatencyDeepStreamPublisher:
         return Gst.PadProbeReturn.OK
 
     def _append_track_event(self, track: dict[str, Any]) -> None:
+        finalized_key = (
+            str(track["source_id"]),
+            int(track["generation"]),
+            int(track["track_id"]),
+        )
+        if finalized_key in self._finalized_track_keys:
+            return
+        self._finalized_track_keys.add(finalized_key)
         self._outbox_path.parent.mkdir(parents=True, exist_ok=True)
         event = {
             "event_id": str(uuid4()),
@@ -1138,11 +1234,91 @@ class LowLatencyDeepStreamPublisher:
             "candidate_count": len(track["candidates"]),
             "status": "media_pending",
         }
-        with self._outbox_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, separators=(",", ":")) + "\n")
+        try:
+            self._event_queue.put_nowait(event)
+        except queue.Full:
+            self._overlay_stats["sqlite_write_failures"] += 1
+            return
         self._ai_stats["ended_person_tracks"] += 1
         self._ai_stats["redis_events_pending"] += 1
         self._ai_stats["minio_upload_pending"] += 1
+
+    @staticmethod
+    def _utc_iso() -> str:
+        return (
+            dt.datetime.now(dt.timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+
+    def _event_db_loop(self) -> None:
+        self._event_db_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self._event_db_path, timeout=5)
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("PRAGMA busy_timeout=5000")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS person_track_events (
+              event_id TEXT PRIMARY KEY, source_id TEXT NOT NULL,
+              generation INTEGER NOT NULL, track_id INTEGER NOT NULL,
+              first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+              ended_at TEXT NOT NULL, duration_ms INTEGER NOT NULL,
+              first_seen_pts INTEGER, last_seen_pts INTEGER,
+              max_confidence REAL, detection_count INTEGER NOT NULL DEFAULT 0,
+              candidate_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL,
+              snapshot_object_key TEXT, crop_object_key TEXT,
+              video_object_key TEXT, snapshot_etag TEXT, crop_etag TEXT,
+              video_etag TEXT, error_message TEXT,
+              retry_count INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+              UNIQUE(source_id,generation,track_id)
+            )
+            """
+        )
+        connection.commit()
+        while not self._event_worker_stop.is_set():
+            try:
+                event = self._event_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            now = self._utc_iso()
+            first_pts = int(event["first_seen_pts"])
+            last_pts = int(event["last_seen_pts"])
+            try:
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO person_track_events
+                    (event_id,source_id,generation,track_id,first_seen_at,
+                     last_seen_at,ended_at,duration_ms,first_seen_pts,
+                     last_seen_pts,candidate_count,status,created_at,updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        event["event_id"], event["source_id"],
+                        event["generation"], event["track_id"], now, now, now,
+                        max(0, (last_pts - first_pts) // 1_000_000),
+                        first_pts, last_pts, event["candidate_count"],
+                        "MEDIA_PENDING", now, now,
+                    ),
+                )
+                connection.commit()
+                if cursor.rowcount:
+                    self._overlay_stats["sqlite_events_created"] += 1
+                    self._outbox_path.parent.mkdir(parents=True, exist_ok=True)
+                    with self._outbox_path.open(
+                        "a", encoding="utf-8"
+                    ) as handle:
+                        handle.write(
+                            json.dumps(event, separators=(",", ":")) + "\n"
+                        )
+                else:
+                    self._overlay_stats["duplicate_track_end_events"] += 1
+            except sqlite3.Error:
+                self._overlay_stats["sqlite_write_failures"] += 1
+            finally:
+                self._event_queue.task_done()
+        connection.close()
 
     def _ai_metadata_probe(
         self,
@@ -1269,6 +1445,27 @@ class LowLatencyDeepStreamPublisher:
                     break
                 if int(obj.class_id) == 0:
                     track_id = int(obj.object_id)
+                    overlay_override = self._overlay_per_camera.get(source_id)
+                    overlay_enabled = (
+                        self._overlay_global
+                        if overlay_override is None
+                        else overlay_override
+                    )
+                    if overlay_enabled:
+                        confidence = max(
+                            float(obj.confidence),
+                            float(getattr(obj, "tracker_confidence", 0.0)),
+                        )
+                        obj.rect_params.border_width = 3
+                        obj.text_params.display_text = (
+                            f"Person | ID: {track_id} | {confidence:.2f}"
+                        )
+                        self._overlay_stats[
+                            "overlay_frames_rendered"
+                        ] += 1
+                    else:
+                        obj.rect_params.border_width = 0
+                        obj.text_params.display_text = ""
                     key = (source_index, generation, track_id)
                     seen.add(key)
                     rect = obj.rect_params
@@ -2047,6 +2244,8 @@ class LowLatencyDeepStreamPublisher:
             return
 
         print("Stopping pipeline")
+        self._event_worker_stop.set()
+        self._event_worker.join(timeout=2.0)
         self._file_publisher_stop.set()
         for process in self._file_publisher_processes:
             if process.poll() is None:
