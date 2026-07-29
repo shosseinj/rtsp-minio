@@ -21,6 +21,7 @@
     .sources{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:9px;margin-top:14px}
     .source{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--panel)}
     .source.offline{border-color:#74343d}.source strong,.source span{display:block}.source span{margin-top:4px;color:var(--muted);font:11px Arial;direction:ltr}
+    .events{margin-top:20px}.event-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px}.event{padding:10px;background:var(--panel);border:1px solid var(--line);border-radius:10px}.event img{width:100%;height:180px;object-fit:contain;background:#000;border-radius:7px}
     button{padding:9px 11px;border:0;border-radius:8px;background:var(--blue);color:#fff;font-weight:700;cursor:pointer}button:disabled{opacity:.35;cursor:not-allowed}
     #fullscreen{display:none;position:fixed;inset:0;z-index:50;background:#000;flex-direction:column}
     #fullscreen .player{flex:1;min-height:0}#fullscreen footer{display:flex;justify-content:space-between;align-items:center;padding:10px 15px;background:#090d13}
@@ -36,6 +37,7 @@
       <div class="tile-grid" id="tile-grid"></div>
     </section>
     <section class="sources" id="sources"></section>
+    <section class="events"><h2>Events</h2><div class="event-grid" id="events"></div></section>
   </main>
   <section id="fullscreen">
     <div class="player"><iframe id="fullscreen-player" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe></div>
@@ -97,6 +99,19 @@
       document.getElementById("system-status").textContent=`${online} NVDEC sources · ${payload.total_nvenc_sessions||1} NVENC`;
     }
     async function refresh(){const response=await fetch("/api/runtime",{cache:"no-store"});applyRuntime(await response.json())}
+    async function refreshEvents(){
+      const events=await (await fetch("/api/events?limit=24",{cache:"no-store"})).json();
+      document.getElementById("events").replaceChildren(...events.map(event=>{
+        const card=document.createElement("article");card.className="event";
+        const title=document.createElement("strong");title.textContent=`${event.source_id} · Track ${event.track_id}`;
+        const meta=document.createElement("p");meta.textContent=`${event.ended_at} · ${event.duration_ms}ms · ${event.status}`;
+        card.append(title,meta);
+        if(event.snapshot_object_key){const img=document.createElement("img");img.loading="lazy";img.src=`/api/events/${event.event_id}/snapshot`;card.append(img);}
+        if(event.video_object_key){const play=document.createElement("a");play.href=`/api/events/${event.event_id}/video`;play.textContent="پخش MP4";play.target="_blank";card.append(play);}
+        if(event.status.includes("FAILED")){const retry=document.createElement("button");retry.textContent="Retry";retry.onclick=()=>fetch(`/api/events/${event.event_id}/retry`,{method:"POST"}).then(refreshEvents);card.append(retry);}
+        return card;
+      }));
+    }
     async function setOverlay(enabled){
       await fetch("/api/overlay",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({global_overlay_enabled:enabled})});
     }
@@ -108,7 +123,7 @@
       document.getElementById("wall-player").src=streamUrl("deepstream-mosaic");
       document.getElementById("close-fullscreen").onclick=closeFullscreen;
       document.getElementById("fullscreen-overlay").onchange=event=>fetch("/api/overlay",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({fullscreen_overlay_enabled:event.target.checked})});
-      await refresh();setInterval(refresh,1000);
+      await refresh();await refreshEvents();setInterval(refresh,1000);setInterval(refreshEvents,5000);
     }
     boot().catch(error=>document.getElementById("system-status").textContent=`خطا: ${error.message}`);
   </script>

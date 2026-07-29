@@ -61,6 +61,10 @@ gi.require_version("Gst", "1.0")
 gi.require_version("GLib", "2.0")
 from gi.repository import GLib, Gst
 
+from app.events.durable_outbox import DurableOutbox
+from app.storage.minio_client import MinioClient
+from app.storage.redis_publisher import RedisStreamPublisher
+
 GST_CAPS_FEATURES_NVMM = "memory:NVMM"
 # NvBufSurfaceMemType.NVBUF_MEM_CUDA_DEVICE. Keeping the numeric GStreamer
 # property value here avoids a Python-binding dependency in this video-only
@@ -220,6 +224,19 @@ class LowLatencyDeepStreamPublisher:
             )
         )
         self._event_worker_stop = threading.Event()
+        self._durable_outbox = DurableOutbox(
+            Path(os.getenv("MEDIA_SPOOL_ROOT", "/workspace/spool/events"))
+        )
+        self._redis_publisher = RedisStreamPublisher(
+            os.getenv("REDIS_HOST", "redis"),
+            int(os.getenv("REDIS_PORT", "6379")),
+        )
+        self._minio_client = MinioClient(
+            os.getenv("MINIO_ENDPOINT", "http://minio:9000"),
+            os.getenv("MINIO_ROOT_USER", "minioadmin"),
+            os.getenv("MINIO_ROOT_PASSWORD", "minioadmin123"),
+        )
+        self._obj_encoder_context: Any = None
         self._event_worker = threading.Thread(
             target=self._event_db_loop,
             name="person-event-sqlite",
@@ -1010,6 +1027,37 @@ class LowLatencyDeepStreamPublisher:
                 jsonify({"error": "event not found"}), 404
             )
 
+        @app.get("/api/events/<event_id>/snapshot")
+        def event_snapshot(event_id: str) -> Any:
+            path = self._durable_outbox.root / event_id / "person.jpg"
+            if not path.is_file():
+                return {"error": "snapshot not available"}, 404
+            return send_file(path, mimetype="image/jpeg", conditional=True)
+
+        @app.get("/api/events/<event_id>/video")
+        def event_video(event_id: str) -> Any:
+            path = self._durable_outbox.root / event_id / "track.mp4"
+            if not path.is_file():
+                return {"error": "video not available"}, 404
+            return send_file(path, mimetype="video/mp4", conditional=True)
+
+        @app.post("/api/events/<event_id>/retry")
+        def event_retry(event_id: str) -> Any:
+            connection = sqlite3.connect(self._event_db_path)
+            cursor = connection.execute(
+                """
+                UPDATE person_track_events
+                SET status='MEDIA_PENDING',error_message=NULL,updated_at=?
+                WHERE event_id=?
+                """,
+                (self._utc_iso(), event_id),
+            )
+            connection.commit()
+            connection.close()
+            if not cursor.rowcount:
+                return {"error": "event not found"}, 404
+            return {"event_id": event_id, "status": "MEDIA_PENDING"}, 202
+
         @app.post("/api/fullscreen/switch")
         @app.post("/api/fullscreen/open")
         @app.post("/api/fullscreen/start")
@@ -1404,6 +1452,16 @@ class LowLatencyDeepStreamPublisher:
             "candidate_count": len(track["candidates"]),
             "status": "media_pending",
         }
+        best = next(
+            (
+                candidate
+                for candidate in track["candidates"]
+                if candidate.get("jpeg_bytes")
+            ),
+            None,
+        )
+        if best is not None:
+            event["_snapshot_bytes"] = best["jpeg_bytes"]
         try:
             self._event_queue.put_nowait(event)
         except queue.Full:
@@ -1475,13 +1533,108 @@ class LowLatencyDeepStreamPublisher:
                 connection.commit()
                 if cursor.rowcount:
                     self._overlay_stats["sqlite_events_created"] += 1
-                    self._outbox_path.parent.mkdir(parents=True, exist_ok=True)
-                    with self._outbox_path.open(
-                        "a", encoding="utf-8"
-                    ) as handle:
-                        handle.write(
-                            json.dumps(event, separators=(",", ":")) + "\n"
+                    public_event = {
+                        key: value for key, value in event.items()
+                        if not key.startswith("_")
+                    }
+                    snapshot = event.get("_snapshot_bytes")
+                    folder = self._durable_outbox.write(
+                        public_event, snapshot
+                    )
+                    try:
+                        self._redis_publisher.publish(
+                            "person.track.events",
+                            {
+                                **public_event,
+                                "status": "MEDIA_PENDING",
+                                "ended_at": now,
+                            },
                         )
+                        self._ai_stats["redis_events_published"] += 1
+                        self._ai_stats["redis_events_pending"] = max(
+                            0, self._ai_stats["redis_events_pending"] - 1
+                        )
+                        self._durable_outbox.mark(
+                            folder, redis_track_published=True
+                        )
+                    except (OSError, ConnectionError):
+                        self._ai_stats["redis_events_pending"] += 1
+                    if snapshot:
+                        date = dt.datetime.now(
+                            dt.timezone.utc
+                        ).strftime("%Y/%m/%d")
+                        prefix = (
+                            f"{event['source_id']}/{date}/"
+                            f"{event['event_id']}"
+                        )
+                        snapshot_key = f"{prefix}/person.jpg"
+                        event_key = f"{prefix}/event.json"
+                        started = time.monotonic()
+                        try:
+                            snapshot_etag = self._minio_client.put(
+                                "person-events",
+                                snapshot_key,
+                                snapshot,
+                                "image/jpeg",
+                            )
+                            event_payload = (
+                                folder / "event.json"
+                            ).read_bytes()
+                            self._minio_client.put(
+                                "person-events",
+                                event_key,
+                                event_payload,
+                                "application/json",
+                            )
+                            connection.execute(
+                                """
+                                UPDATE person_track_events
+                                SET status='PARTIAL',
+                                    snapshot_object_key=?,
+                                    snapshot_etag=?, updated_at=?
+                                WHERE event_id=?
+                                """,
+                                (
+                                    snapshot_key, snapshot_etag, self._utc_iso(),
+                                    event["event_id"],
+                                ),
+                            )
+                            connection.commit()
+                            self._ai_stats["minio_upload_success"] += 1
+                            self._ai_stats["minio_upload_latency_ms"] = round(
+                                (time.monotonic() - started) * 1000, 2
+                            )
+                            try:
+                                self._redis_publisher.publish(
+                                    "person.media.status",
+                                    {
+                                        "event_id": event["event_id"],
+                                        "event_type": "person_media_partial",
+                                        "status": "PARTIAL",
+                                        "snapshot_object_key": snapshot_key,
+                                        "video_object_key": "",
+                                    },
+                                )
+                                self._ai_stats[
+                                    "redis_events_published"
+                                ] += 1
+                            except (OSError, ConnectionError):
+                                self._ai_stats["redis_events_pending"] += 1
+                        except Exception as exc:
+                            connection.execute(
+                                """
+                                UPDATE person_track_events
+                                SET status='FAILED_RETRYABLE',
+                                    error_message=?,retry_count=retry_count+1,
+                                    updated_at=? WHERE event_id=?
+                                """,
+                                (
+                                    str(exc)[:500], self._utc_iso(),
+                                    event["event_id"],
+                                ),
+                            )
+                            connection.commit()
+                            self._ai_stats["minio_upload_pending"] += 1
                 else:
                     self._overlay_stats["duplicate_track_end_events"] += 1
             except sqlite3.Error:
@@ -1510,6 +1663,7 @@ class LowLatencyDeepStreamPublisher:
             return Gst.PadProbeReturn.OK
         now = time.monotonic()
         seen: set[tuple[int, int, int]] = set()
+        snapshot_requests: list[tuple[Any, dict[str, Any]]] = []
         frame_list = batch_meta.frame_meta_list
         while frame_list is not None:
             try:
@@ -1690,6 +1844,21 @@ class LowLatencyDeepStreamPublisher:
                             candidate["keypoints_640"] = pose_rows[
                                 object_index
                             ]["keypoints"]
+                        if self._obj_encoder_context is not None:
+                            encode_args = pyds.NvDsObjEncUsrArgs()
+                            encode_args.saveImg = False
+                            encode_args.attachUsrMeta = True
+                            encode_args.scaleImg = False
+                            encode_args.quality = 88
+                            encode_args.objNum = object_index
+                            pyds.nvds_obj_enc_process(
+                                self._obj_encoder_context,
+                                encode_args,
+                                hash(buffer),
+                                obj,
+                                frame_meta,
+                            )
+                            snapshot_requests.append((obj, candidate))
                         track["candidates"].append(candidate)
                         track["candidates"].sort(
                             key=lambda item: item["quality_score"],
@@ -1711,6 +1880,34 @@ class LowLatencyDeepStreamPublisher:
                 frame_list = frame_list.next
             except StopIteration:
                 break
+
+        if snapshot_requests and self._obj_encoder_context is not None:
+            pyds.nvds_obj_enc_finish(self._obj_encoder_context)
+            for encoded_obj, candidate in snapshot_requests:
+                user_meta_list = encoded_obj.obj_user_meta_list
+                while user_meta_list is not None:
+                    user_meta = pyds.NvDsUserMeta.cast(
+                        user_meta_list.data
+                    )
+                    if (
+                        user_meta.base_meta.meta_type
+                        == pyds.NvDsMetaType.NVDS_CROP_IMAGE_META
+                    ):
+                        output = pyds.NvDsObjEncOutParams.cast(
+                            user_meta.user_meta_data
+                        ).outBuffer()
+                        if output is not None:
+                            candidate["jpeg_bytes"] = output.tobytes()
+                            self._ai_stats[
+                                "snapshot_encode_success"
+                            ] = self._ai_stats.get(
+                                "snapshot_encode_success", 0
+                            ) + 1
+                        break
+                    try:
+                        user_meta_list = user_meta_list.next
+                    except StopIteration:
+                        break
 
         timeout = int(os.getenv("PERSON_TRACK_END_TIMEOUT_MS", "1500")) / 1000.0
         expired = [
@@ -2009,11 +2206,17 @@ class LowLatencyDeepStreamPublisher:
                     f"TensorRT person engine is missing: {engine_path}"
                 )
             try:
-                import pyds  # noqa: F401
+                import pyds
             except ImportError as exc:
                 raise RuntimeError(
                     "AI Stream requires official pyds for DeepStream 7.1"
                 ) from exc
+            if os.getenv("GPU_SNAPSHOT_ENABLED", "false").lower() in {
+                "1", "true", "yes", "on"
+            }:
+                self._obj_encoder_context = (
+                    pyds.nvds_obj_enc_create_context(self.settings.gpu_id)
+                )
 
             person_infer = self._make("nvinfer", "person-tensorrt")
             person_infer.set_property("config-file-path", str(infer_config))
@@ -2477,6 +2680,10 @@ class LowLatencyDeepStreamPublisher:
         self._file_publisher_processes.clear()
         self.pipeline.send_event(Gst.Event.new_eos())
         self.pipeline.set_state(Gst.State.NULL)
+        if self._obj_encoder_context is not None:
+            import pyds
+            pyds.nvds_obj_enc_destroy_context(self._obj_encoder_context)
+            self._obj_encoder_context = None
 
         if self._web_server is not None:
             self._web_server.shutdown()

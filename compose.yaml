@@ -1,4 +1,23 @@
 services:
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:-minioadmin}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:-minioadmin123}"
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - ./data/minio:/data
+
   mediamtx:
     image: bluenviron/mediamtx:1.18.2
     restart: unless-stopped
@@ -45,6 +64,7 @@ services:
       AI_FULL_FRAME_CPU_COPY_ALLOWED: "false"
       REDIS_STREAM_ENABLED: "true"
       MINIO_MEDIA_ENABLED: "true"
+      GPU_SNAPSHOT_ENABLED: "false"
       AI_OVERLAY_ENABLED: "false"
       AI_OVERLAY_DEFAULT_ENABLED: "true"
       AI_OVERLAY_SHOW_TRACK_ID: "true"
@@ -70,6 +90,8 @@ services:
       BENCHMARK_STATIC_ONLY: "false"
     depends_on:
       - mediamtx
+      - redis
+      - minio
     working_dir: /workspace/apps/deepstream-imagedata-multistream
     ports:
       - "7071:7070"

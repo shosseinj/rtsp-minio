@@ -5,4 +5,6 @@ camera_sources.local.json
 __pycache__/
 *.pyc
 *.mp4
+*.json
+data/*
 weights/*
