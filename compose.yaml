@@ -15,9 +15,7 @@ services:
       MTX_WEBRTCLOCALUDPADDRESS: ":8190"
 
   deepstream:
-    build:
-      context: .
-    image: deepstream-camera-wall:ds71
+    image: merged-video-ai-router:v10-flat
     gpus: all
     ipc: host
     environment:
@@ -29,11 +27,27 @@ services:
       STATIC_CAMERA_SOURCE_COUNT: "0"
       STATIC_CAMERA_EMULATION: "false"
       STATIC_CAMERA_PASSTHROUGH: "false"
-      VIDEO_ONLY_MODE: "true"
-      AI_ENABLED: "false"
-      AI_STREAM_ENABLED: "false"
+      VIDEO_ONLY_MODE: "false"
+      VIDEO_STREAM_ON_DEMAND: "true"
+      VIDEO_TRANSPORT_BACKEND: "webrtc"
+      VIDEO_ENCODER_BACKEND: "nvenc"
+      AI_ENABLED: "true"
+      AI_STREAM_ENABLED: "true"
+      AI_PERSON_DETECTOR_ENABLED: "true"
+      AI_PERSON_INPUT_WIDTH: "640"
+      AI_PERSON_INPUT_HEIGHT: "640"
+      AI_PERSON_BACKEND: "tensorrt"
+      AI_TRACKER_ENABLED: "true"
+      AI_TRACKER_BACKEND: "nvtracker"
+      PERSON_TRACK_END_TIMEOUT_MS: "1500"
+      PERSON_TRACK_MAX_CANDIDATES: "8"
+      PERSON_TRACK_CANDIDATE_INTERVAL_MS: "500"
+      AI_FULL_FRAME_CPU_COPY_ALLOWED: "false"
+      REDIS_STREAM_ENABLED: "true"
+      MINIO_MEDIA_ENABLED: "true"
       AI_OVERLAY_ENABLED: "false"
       JPEG_ENABLED: "false"
+      JPEG_PRESENTATION_ENABLED: "false"
       CPU_PRESENTATION_ENABLED: "false"
       MOSAIC_PUBLISH_ENABLED: "true"
       INDIVIDUAL_STREAMS_ENABLED: "false"

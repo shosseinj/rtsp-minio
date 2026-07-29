@@ -35,6 +35,8 @@ Browser:
 from __future__ import annotations
 
 import argparse
+import configparser
+import ctypes
 import json
 import math
 import os
@@ -48,6 +50,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
+from uuid import uuid4
 
 import gi
 
@@ -136,6 +139,32 @@ class LowLatencyDeepStreamPublisher:
             "window_started": now,
         }
         self._last_wall_buffer_at = 0.0
+        self._ai_enabled = os.getenv("AI_STREAM_ENABLED", "false").lower() in {
+            "1", "true", "yes", "on"
+        }
+        self._ai_stats: dict[str, Any] = {
+            "ai_frames_received": 0,
+            "ai_frames_resized_gpu": 0,
+            "person_detections_total": 0,
+            "pose_keypoints_extracted_total": 0,
+            "active_person_tracks": 0,
+            "ended_person_tracks": 0,
+            "track_candidate_count": 0,
+            "track_candidates_dropped": 0,
+            "redis_events_published": 0,
+            "redis_events_pending": 0,
+            "minio_upload_success": 0,
+            "minio_upload_pending": 0,
+            "full_frame_cpu_copy_count": 0,
+            "full_resolution_ndarray_queue_count": 0,
+            "window_frames": 0,
+            "window_started": now,
+            "person_inference_fps": 0.0,
+        }
+        self._person_tracks: dict[tuple[int, int, int], dict[str, Any]] = {}
+        self._outbox_path = Path(
+            os.getenv("AI_DURABLE_OUTBOX_PATH", "/workspace/spool/events.jsonl")
+        )
 
     @staticmethod
     def _make(factory: str, name: str) -> Gst.Element:
@@ -744,7 +773,26 @@ class LowLatencyDeepStreamPublisher:
                     "total_nvenc_sessions": (
                         2 if self._fullscreen_branch is not None else 1
                     ),
-                    "full_frame_cpu_copy_count": 0,
+                    "video_branch_active": True,
+                    "active_video_subscribers": -1,
+                    "active_video_nvenc_sessions": (
+                        2 if self._fullscreen_branch is not None else 1
+                    ),
+                    "ai": {
+                        key: (
+                            round(float(value), 2)
+                            if isinstance(value, float)
+                            else value
+                        )
+                        for key, value in self._ai_stats.items()
+                        if key not in {"window_frames", "window_started"}
+                    },
+                    "full_frame_cpu_copy_count": self._ai_stats[
+                        "full_frame_cpu_copy_count"
+                    ],
+                    "full_resolution_ndarray_queue_count": self._ai_stats[
+                        "full_resolution_ndarray_queue_count"
+                    ],
                 }
             )
 
@@ -1076,6 +1124,317 @@ class LowLatencyDeepStreamPublisher:
                 self._wall_stats["window_started"] = now
         return Gst.PadProbeReturn.OK
 
+    def _append_track_event(self, track: dict[str, Any]) -> None:
+        self._outbox_path.parent.mkdir(parents=True, exist_ok=True)
+        event = {
+            "event_id": str(uuid4()),
+            "event_type": "person_track_ended",
+            "source_id": track["source_id"],
+            "generation": track["generation"],
+            "track_id": track["track_id"],
+            "first_seen_pts": track["first_seen_pts"],
+            "last_seen_pts": track["last_seen_pts"],
+            "best_snapshot_artifact_id": None,
+            "candidate_count": len(track["candidates"]),
+            "status": "media_pending",
+        }
+        with self._outbox_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, separators=(",", ":")) + "\n")
+        self._ai_stats["ended_person_tracks"] += 1
+        self._ai_stats["redis_events_pending"] += 1
+        self._ai_stats["minio_upload_pending"] += 1
+
+    def _ai_metadata_probe(
+        self,
+        _pad: Gst.Pad,
+        info: Gst.PadProbeInfo,
+    ) -> Gst.PadProbeReturn:
+        buffer = info.get_buffer()
+        if buffer is None:
+            return Gst.PadProbeReturn.OK
+        try:
+            import pyds
+        except ImportError as exc:
+            raise RuntimeError(
+                "AI_STREAM_ENABLED requires official DeepStream pyds"
+            ) from exc
+
+        batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(buffer))
+        if batch_meta is None:
+            return Gst.PadProbeReturn.OK
+        now = time.monotonic()
+        seen: set[tuple[int, int, int]] = set()
+        frame_list = batch_meta.frame_meta_list
+        while frame_list is not None:
+            try:
+                frame_meta = pyds.NvDsFrameMeta.cast(frame_list.data)
+            except StopIteration:
+                break
+            source_index = int(frame_meta.pad_index)
+            generation = int(self._source_stats[source_index]["generation"])
+            source_id = str(
+                next(
+                    (
+                        camera["camera_id"]
+                        for camera in self.settings.cameras
+                        if int(camera["source_index"]) == source_index
+                    ),
+                    source_index,
+                )
+            )
+            self._ai_stats["ai_frames_received"] += 1
+            self._ai_stats["ai_frames_resized_gpu"] += 1
+            self._ai_stats["window_frames"] += 1
+            pose_rows: list[dict[str, Any]] = []
+            user_list = frame_meta.frame_user_meta_list
+            while user_list is not None:
+                try:
+                    user_meta = pyds.NvDsUserMeta.cast(user_list.data)
+                except StopIteration:
+                    break
+                if (
+                    user_meta.base_meta.meta_type
+                    == pyds.NvDsMetaType.NVDSINFER_TENSOR_OUTPUT_META
+                ):
+                    tensor_meta = pyds.NvDsInferTensorMeta.cast(
+                        user_meta.user_meta_data
+                    )
+                    for layer_index in range(
+                        int(tensor_meta.num_output_layers)
+                    ):
+                        layer = tensor_meta.output_layers_info(layer_index)
+                        if str(layer.layerName or "") != "output0":
+                            continue
+                        dims = layer.inferDims
+                        shape = [
+                            int(dims.d[index])
+                            for index in range(int(dims.numDims))
+                        ]
+                        if shape != [300, 57]:
+                            continue
+                        try:
+                            address = pyds.get_ptr(layer.buffer)
+                        except (TypeError, ValueError):
+                            continue
+                        if address == 0:
+                            continue
+                        try:
+                            values = ctypes.cast(
+                                address,
+                                ctypes.POINTER(ctypes.c_float * (300 * 57)),
+                            ).contents
+                        except (TypeError, ValueError):
+                            continue
+                        for row_index in range(300):
+                            offset = row_index * 57
+                            confidence = float(values[offset + 4])
+                            class_id = int(round(float(values[offset + 5])))
+                            if confidence < 0.25 or class_id != 0:
+                                continue
+                            keypoints = [
+                                {
+                                    "x": float(values[offset + 6 + kp * 3]),
+                                    "y": float(values[offset + 7 + kp * 3]),
+                                    "confidence": float(
+                                        values[offset + 8 + kp * 3]
+                                    ),
+                                }
+                                for kp in range(17)
+                            ]
+                            pose_rows.append(
+                                {
+                                    "bbox_640": [
+                                        float(values[offset]),
+                                        float(values[offset + 1]),
+                                        float(values[offset + 2]),
+                                        float(values[offset + 3]),
+                                    ],
+                                    "confidence": confidence,
+                                    "keypoints": keypoints,
+                                }
+                            )
+                            self._ai_stats[
+                                "pose_keypoints_extracted_total"
+                            ] += 17
+                try:
+                    user_list = user_list.next
+                except StopIteration:
+                    break
+            obj_list = frame_meta.obj_meta_list
+            object_index = 0
+            while obj_list is not None:
+                try:
+                    obj = pyds.NvDsObjectMeta.cast(obj_list.data)
+                except StopIteration:
+                    break
+                if int(obj.class_id) == 0:
+                    track_id = int(obj.object_id)
+                    key = (source_index, generation, track_id)
+                    seen.add(key)
+                    rect = obj.rect_params
+                    bbox = [
+                        float(rect.left),
+                        float(rect.top),
+                        float(rect.left + rect.width),
+                        float(rect.top + rect.height),
+                    ]
+                    pts = int(frame_meta.buf_pts)
+                    track = self._person_tracks.setdefault(
+                        key,
+                        {
+                            "source_id": source_id,
+                            "generation": generation,
+                            "track_id": track_id,
+                            "first_seen_pts": pts,
+                            "last_seen_pts": pts,
+                            "last_seen_at": now,
+                            "last_bbox_original": bbox,
+                            "detection_count": 0,
+                            "candidates": [],
+                            "last_candidate_at": 0.0,
+                        },
+                    )
+                    track["last_seen_pts"] = pts
+                    track["last_seen_at"] = now
+                    track["last_bbox_original"] = bbox
+                    track["detection_count"] += 1
+                    self._ai_stats["person_detections_total"] += 1
+                    interval = int(os.getenv(
+                        "PERSON_TRACK_CANDIDATE_INTERVAL_MS", "500"
+                    )) / 1000.0
+                    if now - track["last_candidate_at"] >= interval:
+                        candidate = {
+                            "frame_token": (
+                                f"{source_id}:{generation}:"
+                                f"{int(frame_meta.frame_num)}:{pts}"
+                            ),
+                            "pts": pts,
+                            "bbox_original": bbox,
+                            "detection_confidence": float(obj.confidence),
+                            "quality_score": (
+                                float(rect.width * rect.height)
+                                * max(float(obj.confidence), 0.0)
+                            ),
+                        }
+                        if object_index < len(pose_rows):
+                            candidate["bbox_640"] = pose_rows[object_index][
+                                "bbox_640"
+                            ]
+                            candidate["keypoints_640"] = pose_rows[
+                                object_index
+                            ]["keypoints"]
+                        track["candidates"].append(candidate)
+                        track["candidates"].sort(
+                            key=lambda item: item["quality_score"],
+                            reverse=True,
+                        )
+                        maximum = int(os.getenv(
+                            "PERSON_TRACK_MAX_CANDIDATES", "8"
+                        ))
+                        if len(track["candidates"]) > maximum:
+                            track["candidates"].pop()
+                            self._ai_stats["track_candidates_dropped"] += 1
+                        track["last_candidate_at"] = now
+                    object_index += 1
+                try:
+                    obj_list = obj_list.next
+                except StopIteration:
+                    break
+            try:
+                frame_list = frame_list.next
+            except StopIteration:
+                break
+
+        timeout = int(os.getenv("PERSON_TRACK_END_TIMEOUT_MS", "1500")) / 1000.0
+        expired = [
+            key for key, track in self._person_tracks.items()
+            if key not in seen and now - track["last_seen_at"] >= timeout
+        ]
+        for key in expired:
+            self._append_track_event(self._person_tracks.pop(key))
+        elapsed = now - self._ai_stats["window_started"]
+        if elapsed >= 1.0:
+            self._ai_stats["person_inference_fps"] = (
+                self._ai_stats["window_frames"] / elapsed
+            )
+            self._ai_stats["window_frames"] = 0
+            self._ai_stats["window_started"] = now
+        self._ai_stats["active_person_tracks"] = len(self._person_tracks)
+        self._ai_stats["track_candidate_count"] = sum(
+            len(track["candidates"]) for track in self._person_tracks.values()
+        )
+        return Gst.PadProbeReturn.OK
+
+    def _pose_tensor_probe(
+        self,
+        _pad: Gst.Pad,
+        info: Gst.PadProbeInfo,
+    ) -> Gst.PadProbeReturn:
+        """Read only the small 300x57 output tensor before tracker ownership."""
+        buffer = info.get_buffer()
+        if buffer is None:
+            return Gst.PadProbeReturn.OK
+        import pyds
+
+        batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(buffer))
+        if batch_meta is None:
+            return Gst.PadProbeReturn.OK
+        frame_list = batch_meta.frame_meta_list
+        while frame_list is not None:
+            frame_meta = pyds.NvDsFrameMeta.cast(frame_list.data)
+            user_list = frame_meta.frame_user_meta_list
+            while user_list is not None:
+                user_meta = pyds.NvDsUserMeta.cast(user_list.data)
+                if (
+                    user_meta.base_meta.meta_type
+                    == pyds.NvDsMetaType.NVDSINFER_TENSOR_OUTPUT_META
+                ):
+                    tensor_meta = pyds.NvDsInferTensorMeta.cast(
+                        user_meta.user_meta_data
+                    )
+                    for index in range(int(tensor_meta.num_output_layers)):
+                        layer = tensor_meta.output_layers_info(index)
+                        if str(layer.layerName or "") != "output0":
+                            continue
+                        dims = layer.inferDims
+                        shape = [
+                            int(dims.d[dim])
+                            for dim in range(int(dims.numDims))
+                        ]
+                        if shape != [300, 57]:
+                            continue
+                        try:
+                            address = pyds.get_ptr(layer.buffer)
+                        except (TypeError, ValueError):
+                            continue
+                        if address == 0:
+                            continue
+                        try:
+                            values = ctypes.cast(
+                                address,
+                                ctypes.POINTER(ctypes.c_float * (300 * 57)),
+                            ).contents
+                        except (TypeError, ValueError):
+                            continue
+                        detections = sum(
+                            1
+                            for row in range(300)
+                            if float(values[row * 57 + 4]) >= 0.25
+                            and int(round(float(values[row * 57 + 5]))) == 0
+                        )
+                        self._ai_stats[
+                            "pose_keypoints_extracted_total"
+                        ] += detections * 17
+                try:
+                    user_list = user_list.next
+                except StopIteration:
+                    break
+            try:
+                frame_list = frame_list.next
+            except StopIteration:
+                break
+        return Gst.PadProbeReturn.OK
+
     def _source_fps_probe(
         self,
         pad: Gst.Pad,
@@ -1265,9 +1624,83 @@ class LowLatencyDeepStreamPublisher:
             NVBUF_MEM_CUDA_DEVICE,
         )
 
-        # Build source tees. One GPU-memory branch feeds the mosaic and another
-        # publishes the camera independently at its native decoded resolution.
+        # The source tee preserves each native NVMM surface. The batched AI
+        # representation is produced downstream by gst-nvinfer on GPU.
         pipeline.add(streammux)
+        analytics_tail: Gst.Element = streammux
+        if self._ai_enabled:
+            engine_path = Path(
+                "/workspace/weights/face_recognition/linux_trt10/"
+                "yolo26s-pose_dynamic_b26_trt103.engine"
+            )
+            infer_config = Path(
+                "/workspace/apps/deepstream-imagedata-multistream/"
+                "ai/person_nvinfer.txt"
+            )
+            if not engine_path.is_file():
+                raise RuntimeError(
+                    f"TensorRT person engine is missing: {engine_path}"
+                )
+            try:
+                import pyds  # noqa: F401
+            except ImportError as exc:
+                raise RuntimeError(
+                    "AI Stream requires official pyds for DeepStream 7.1"
+                ) from exc
+
+            person_infer = self._make("nvinfer", "person-tensorrt")
+            person_infer.set_property("config-file-path", str(infer_config))
+            self._set_if_supported(person_infer, "batch-size", number_sources)
+            self._set_if_supported(
+                person_infer, "gpu-id", self.settings.gpu_id
+            )
+
+            tracker = self._make("nvtracker", "person-nvdcf-tracker")
+            tracker_config = configparser.ConfigParser()
+            tracker_config.read(
+                "/workspace/apps/deepstream-imagedata-multistream/"
+                "ai/tracker_config.txt"
+            )
+            tracker_values = tracker_config["tracker"]
+            tracker_properties: dict[str, Any] = {
+                "tracker-width": tracker_values.getint("tracker-width"),
+                "tracker-height": tracker_values.getint("tracker-height"),
+                "gpu-id": tracker_values.getint("gpu-id"),
+                "ll-lib-file": tracker_values["ll-lib-file"],
+                "ll-config-file": tracker_values["ll-config-file"],
+                "display-tracking-id": tracker_values.getint(
+                    "display-tracking-id"
+                ),
+                "enable-batch-process": tracker_values.getint(
+                    "enable-batch-process"
+                ),
+                "enable-past-frame": tracker_values.getint(
+                    "enable-past-frame"
+                ),
+            }
+            for name, value in tracker_properties.items():
+                self._set_if_supported(tracker, name, value)
+            pipeline.add(person_infer)
+            pipeline.add(tracker)
+            self._link_many([streammux, person_infer, tracker])
+            infer_src = person_infer.get_static_pad("src")
+            if infer_src is None:
+                raise RuntimeError("Could not get person nvinfer src pad")
+            infer_src.add_probe(
+                Gst.PadProbeType.BUFFER,
+                self._pose_tensor_probe,
+            )
+            tracker_src = tracker.get_static_pad("src")
+            if tracker_src is None:
+                raise RuntimeError("Could not get NvDCF tracker src pad")
+            tracker_src.add_probe(
+                Gst.PadProbeType.BUFFER,
+                self._ai_metadata_probe,
+            )
+            analytics_tail = tracker
+
+        # Build source tees. One GPU-memory branch feeds analytics/mosaic and
+        # the native surface remains available for on-demand fullscreen.
         camera_by_source: dict[int, dict[str, Any]] = {}
         for camera in self.settings.cameras:
             camera_by_source.setdefault(int(camera["source_index"]), camera)
@@ -1427,7 +1860,7 @@ class LowLatencyDeepStreamPublisher:
             self._set_if_supported(sink, "async", False)
             self._set_if_supported(sink, "qos", False)
             pipeline.add(sink)
-            if not streammux.link(sink):
+            if not analytics_tail.link(sink):
                 raise RuntimeError("Could not link decode-only sink")
             bus = pipeline.get_bus()
             if bus is None:
@@ -1446,9 +1879,9 @@ class LowLatencyDeepStreamPublisher:
             self._set_if_supported(sink, "async", False)
             self._set_if_supported(sink, "qos", False)
             pipeline.add(sink)
-            if not streammux.link(sink):
+            if not analytics_tail.link(sink):
                 raise RuntimeError("Could not link mosaic-disabled sink")
-            mux_src_pad = streammux.get_static_pad("src")
+            mux_src_pad = analytics_tail.get_static_pad("src")
             if mux_src_pad is None:
                 raise RuntimeError("Could not get nvstreammux src pad")
             mux_src_pad.add_probe(
@@ -1556,7 +1989,7 @@ class LowLatencyDeepStreamPublisher:
         for element in elements:
             pipeline.add(element)
 
-        self._link_many([streammux, *elements])
+        self._link_many([analytics_tail, *elements])
 
         # Count the frames actually delivered by the single Wall NVENC path.
         wall_encoded_pad = parser.get_static_pad("src")
