@@ -1,0 +1,36 @@
+services:
+  deepstream:
+    environment:
+      # Static-only mode prevents camera_sources.local.json from being loaded,
+      # so no RTSP camera address is contacted in this mode.
+      BENCHMARK_STATIC_ONLY: "true"
+      STATIC_CAMERA_EMULATION: "true"
+      STATIC_CAMERA_LIMIT: "24"
+      STATIC_CAMERA_SOURCE_COUNT: "24"
+      STATIC_CAMERA_PASSTHROUGH: "false"
+      RTSP_CAMERA_LIMIT: "0"
+      RTSP_CAMERA_COPIES: "1"
+    command:
+      - python3
+      - deepstream_low_latency_rtsp_and_file.py
+      - --publish-url
+      - rtsp://mediamtx:8554/deepstream-mosaic
+      - --video-folder
+      - /workspace/data
+      - --loop-files
+      - --transport
+      - tcp
+      - --rtsp-latency
+      - "120"
+      - --output-width
+      - "1920"
+      - --output-height
+      - "1080"
+      - --mux-width
+      - "2944"
+      - --mux-height
+      - "1664"
+      - --bitrate
+      - "8000000"
+      - --web-port
+      - "7070"
