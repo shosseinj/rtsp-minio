@@ -2338,12 +2338,11 @@ class LowLatencyDeepStreamPublisher:
             pipeline.add(tee)
             pipeline.add(mosaic_queue)
             self._source_tees[index] = tee
-            emulate_static = (
-                uri.lower().startswith("file://")
-                and os.getenv("STATIC_CAMERA_EMULATION", "false").lower()
-                in {"1", "true", "yes", "on"}
-            )
-            if emulate_static:
+            # File inputs are not live and otherwise decode as fast as NVDEC
+            # allows. Pace their NVMM buffers against the pipeline clock before
+            # the leaky realtime branch so FPS, latency, and GPU load represent
+            # normal playback. This also keeps explicit EOS seek loops paced.
+            if uri.lower().startswith("file://"):
                 pacer = self._make("identity", f"source-pacer-{index:02d}")
                 self._set_if_supported(pacer, "sync", True)
                 self._set_if_supported(pacer, "single-segment", True)
@@ -2562,6 +2561,10 @@ class LowLatencyDeepStreamPublisher:
             raise RuntimeError("Could not get Wall output queue src pad")
         output_src_pad.add_probe(
             Gst.PadProbeType.BUFFER,
+            self._fullscreen_retimestamp_probe,
+        )
+        output_src_pad.add_probe(
+            Gst.PadProbeType.BUFFER,
             self._wall_rate_limit_probe,
         )
 
@@ -2594,7 +2597,7 @@ class LowLatencyDeepStreamPublisher:
         self._configure_rtsp_publisher(
             publisher,
             self.settings.publish_url,
-            not has_live_source,
+            False,
         )
 
         elements = [
@@ -2891,11 +2894,24 @@ def parse_args() -> Settings:
         if not folder.exists() or not folder.is_dir():
             parser.error(f"--video-folder is not a directory: {folder}")
         supported = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
+        excluded_static_paths = {
+            item.strip().replace("\\", "/").lower()
+            for item in os.getenv("STATIC_CAMERA_EXCLUDE", "").split(",")
+            if item.strip()
+        }
         video_paths = sorted(
             (
                 path
                 for path in folder.rglob("*")
-                if path.is_file() and path.suffix.lower() in supported
+                if path.is_file()
+                and path.suffix.lower() in supported
+                and str(path.relative_to(folder)).replace(
+                    "\\", "/"
+                ).lower() not in excluded_static_paths
+                and not any(
+                    part.startswith(".") or part.lower() == "minio"
+                    for part in path.relative_to(folder).parts[:-1]
+                )
             ),
             key=lambda item: str(item.relative_to(folder)).lower(),
         )
@@ -2922,14 +2938,13 @@ def parse_args() -> Settings:
         )
         if requested_static_count < 1:
             parser.error("STATIC_CAMERA_SOURCE_COUNT must be positive")
-        selected_paths = (
-            [
-                video_paths[index % len(video_paths)]
-                for index in range(requested_static_count)
-            ]
-            if static_emulation and video_paths
-            else video_paths
-        )
+        # STATIC_CAMERA_LIMIT must be honored for both source implementations.
+        # Cycle only when the requested camera count exceeds the available
+        # files; otherwise select a deterministic subset.
+        selected_paths = [
+            video_paths[index % len(video_paths)]
+            for index in range(requested_static_count)
+        ] if video_paths else []
         for file_index, path in enumerate(selected_paths, start=1):
             source_index = len(requested_sources)
             requested_sources.append(str(path))
