@@ -13,7 +13,7 @@
     .wall{position:relative;aspect-ratio:16/9;border:1px solid var(--line);border-radius:14px;overflow:hidden;background:#000}
     iframe{width:100%;height:100%;border:0}.badge{position:absolute;top:10px;z-index:2;padding:7px 10px;border-radius:8px;background:#000c;font:700 11px Arial}
     #wall-fps{left:10px;color:#a9c8ff}.encoder{right:10px;color:#8df0cb}
-    .tile-grid{position:absolute;inset:0;z-index:3;display:grid;grid-template-columns:repeat(6,1fr);grid-template-rows:repeat(4,1fr);direction:ltr}
+    .tile-grid{position:absolute;inset:0;z-index:3;display:grid;grid-template-columns:repeat(var(--wall-columns,6),1fr);grid-template-rows:repeat(var(--wall-rows,4),1fr);direction:ltr}
     .tile-hit{position:relative;border:1px solid #ffffff35;background:transparent;color:#fff;cursor:pointer}
     .tile-hit:hover{border-color:#6da5ff;box-shadow:inset 0 0 0 2px #397ff688}
     .tile-hit.offline{background:#21070a99;border-color:#ff667888;cursor:not-allowed}
@@ -28,9 +28,9 @@
   </style>
 </head>
 <body>
-  <header><h1>دیوار ۲۴ منبع DeepStream</h1><label><input id="overlay-toggle" type="checkbox"> نمایش تشخیص و Track ID</label><div class="status" id="system-status">در حال اتصال…</div></header>
+  <header><h1 id="wall-title">دیوار منابع DeepStream</h1><label><input id="overlay-toggle" type="checkbox"> نمایش تشخیص و Track ID</label><div class="status" id="system-status">در حال اتصال…</div></header>
   <main>
-    <div class="summary"><strong>Wall 6×4 · 1920×1080 · 12 FPS</strong><span id="online-count">—</span></div>
+    <div class="summary"><strong id="wall-summary">Wall · 1920×1080</strong><span id="online-count">—</span></div>
     <section class="wall">
       <iframe id="wall-player" title="Video Wall" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe>
       <span class="badge" id="wall-fps">WALL 0.0 FPS</span><span class="badge encoder">1× NVENC</span>
@@ -82,6 +82,12 @@
       }));
     }
     function applyRuntime(payload){
+      const layout=payload.wall_layout||{rows:4,columns:6,camera_count:state.cameras.length};
+      const grid=document.getElementById("tile-grid");
+      grid.style.setProperty("--wall-columns",Math.max(1,Number(layout.columns)||1));
+      grid.style.setProperty("--wall-rows",Math.max(1,Number(layout.rows)||1));
+      document.getElementById("wall-title").textContent=`دیوار ${layout.camera_count||state.cameras.length} منبع DeepStream`;
+      document.getElementById("wall-summary").textContent=`Wall ${layout.columns}×${layout.rows} · 1920×1080 · ${Number(payload.wall_fps||0).toFixed(1)} FPS`;
       state.runtime=new Map(payload.sources.map(item=>[item.camera_id,item]));let online=0;
       document.querySelectorAll(".source").forEach(card=>{
         const item=state.runtime.get(card.dataset.id);if(!item)return;if(item.online)online++;

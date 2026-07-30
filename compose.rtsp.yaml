@@ -1,0 +1,35 @@
+services:
+  deepstream:
+    environment:
+      BENCHMARK_STATIC_ONLY: "false"
+      RTSP_CAMERA_LIMIT: "8"
+      RTSP_CAMERA_COPIES: "3"
+      RTSP_SHARED_INGEST: "false"
+      STATIC_CAMERA_LIMIT: "0"
+      STATIC_CAMERA_SOURCE_COUNT: "0"
+      STATIC_CAMERA_EMULATION: "false"
+      WALL_COLUMNS: "6"
+      WALL_ROWS: "4"
+    command:
+      - python3
+      - deepstream_low_latency_rtsp_and_file.py
+      - --publish-url
+      - rtsp://mediamtx:8554/deepstream-mosaic
+      - --camera-config
+      - /workspace/camera_sources.local.json
+      - --transport
+      - tcp
+      - --rtsp-latency
+      - "120"
+      - --output-width
+      - "1920"
+      - --output-height
+      - "1080"
+      - --mux-width
+      - "2944"
+      - --mux-height
+      - "1664"
+      - --bitrate
+      - "8000000"
+      - --web-port
+      - "7070"

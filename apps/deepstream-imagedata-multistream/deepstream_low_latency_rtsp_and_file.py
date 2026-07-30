@@ -63,6 +63,7 @@ from gi.repository import GLib, Gst
 
 from app.events.durable_outbox import DurableOutbox
 from app.storage.minio_client import MinioClient
+from app.dashboard.layout import wall_layout
 from app.storage.redis_publisher import RedisStreamPublisher
 
 GST_CAPS_FEATURES_NVMM = "memory:NVMM"
@@ -595,34 +596,18 @@ class LowLatencyDeepStreamPublisher:
         return False
 
     def _stop_fullscreen_branch(self) -> bool:
-        self._fullscreen_state = "STOPPING"
+        """Logically close fullscreen without tearing down NVIDIA elements.
+
+        Removing nvv4l2h264enc / rtspclientsink dynamically while buffers are
+        in flight can crash DeepStream with SIGSEGV.  Keep one warm branch and
+        reuse it for the next camera; the browser can disconnect independently.
+        """
         with self._fullscreen_lock:
-            branch = self._fullscreen_branch
-            if branch is None or self.pipeline is None:
+            if self._fullscreen_branch is None:
                 self._fullscreen_state = "STOPPED"
                 return False
-            tee_pad = branch["tee_pad"]
-            queue = branch["elements"][0]
-            queue_sink = queue.get_static_pad("sink")
-            if queue_sink is not None:
-                tee_pad.unlink(queue_sink)
-            branch["tee"].release_request_pad(tee_pad)
-            for element in reversed(branch["elements"]):
-                element.set_state(Gst.State.NULL)
-                self.pipeline.remove(element)
-            self._fullscreen_branch = None
-            self._fullscreen_state = "STOPPED"
+            self._fullscreen_state = "IDLE"
             self._fullscreen_metrics["fullscreen_destroy_success"] += 1
-            with self._fps_lock:
-                self._fullscreen_stats.update(
-                    {
-                        "camera_id": None,
-                        "fps": 0.0,
-                        "frames": 0,
-                        "window_frames": 0,
-                        "window_started": time.monotonic(),
-                    }
-                )
         return False
 
     def _start_fullscreen_branch(
@@ -640,7 +625,6 @@ class LowLatencyDeepStreamPublisher:
             return False
         if self._fullscreen_branch is not None:
             self._fullscreen_metrics["fullscreen_switch_requests"] += 1
-            self._stop_fullscreen_branch()
         with self._fullscreen_lock:
             branch = self._fullscreen_branch
             if branch is not None:
@@ -664,6 +648,9 @@ class LowLatencyDeepStreamPublisher:
                         "tee_pad": new_pad,
                     }
                 )
+                self._fullscreen_state = "ACTIVE"
+                self._fullscreen_metrics["fullscreen_encoder_reuse_count"] += 1
+                self._fullscreen_metrics["fullscreen_source_switch_count"] += 1
                 with self._fps_lock:
                     self._fullscreen_stats.update(
                         {
@@ -748,7 +735,7 @@ class LowLatencyDeepStreamPublisher:
             f"{int(self._source_stats[source_index]['generation'])}"
         )
         fullscreen_url = f"{parsed.scheme}://{parsed.netloc}/{stream_path}"
-        self._configure_rtsp_publisher(publisher, fullscreen_url, False)
+        self._configure_rtsp_publisher(publisher, fullscreen_url, True)
         elements = [
             queue,
             converter,
@@ -899,9 +886,18 @@ class LowLatencyDeepStreamPublisher:
                             ),
                         }
                     )
+            wall_rows, wall_columns = wall_layout(
+                len(self.settings.cameras),
+                int(os.getenv("WALL_COLUMNS", "6")),
+            )
             return jsonify(
                 {
                     "sources": sources,
+                    "wall_layout": {
+                        "rows": wall_rows,
+                        "columns": wall_columns,
+                        "camera_count": len(self.settings.cameras),
+                    },
                     "wall_fps": round(float(self._wall_stats["fps"]), 1),
                     "wall_frames": int(self._wall_stats["frames"]),
                     "fullscreen": {
@@ -2225,34 +2221,41 @@ class LowLatencyDeepStreamPublisher:
                 person_infer, "gpu-id", self.settings.gpu_id
             )
 
-            tracker = self._make("nvtracker", "person-nvdcf-tracker")
-            tracker_config = configparser.ConfigParser()
-            tracker_config.read(
-                "/workspace/apps/deepstream-imagedata-multistream/"
-                "ai/tracker_config.txt"
-            )
-            tracker_values = tracker_config["tracker"]
-            tracker_properties: dict[str, Any] = {
-                "tracker-width": tracker_values.getint("tracker-width"),
-                "tracker-height": tracker_values.getint("tracker-height"),
-                "gpu-id": tracker_values.getint("gpu-id"),
-                "ll-lib-file": tracker_values["ll-lib-file"],
-                "ll-config-file": tracker_values["ll-config-file"],
-                "display-tracking-id": tracker_values.getint(
-                    "display-tracking-id"
-                ),
-                "enable-batch-process": tracker_values.getint(
-                    "enable-batch-process"
-                ),
-                "enable-past-frame": tracker_values.getint(
-                    "enable-past-frame"
-                ),
-            }
-            for name, value in tracker_properties.items():
-                self._set_if_supported(tracker, name, value)
             pipeline.add(person_infer)
-            pipeline.add(tracker)
-            self._link_many([streammux, person_infer, tracker])
+            tracker_enabled = os.getenv(
+                "AI_TRACKER_ENABLED", "true"
+            ).lower() in {"1", "true", "yes", "on"}
+            tracker = None
+            if tracker_enabled:
+                tracker = self._make("nvtracker", "person-nvdcf-tracker")
+                tracker_config = configparser.ConfigParser()
+                tracker_config.read(
+                    "/workspace/apps/deepstream-imagedata-multistream/"
+                    "ai/tracker_config.txt"
+                )
+                tracker_values = tracker_config["tracker"]
+                tracker_properties: dict[str, Any] = {
+                    "tracker-width": tracker_values.getint("tracker-width"),
+                    "tracker-height": tracker_values.getint("tracker-height"),
+                    "gpu-id": tracker_values.getint("gpu-id"),
+                    "ll-lib-file": tracker_values["ll-lib-file"],
+                    "ll-config-file": tracker_values["ll-config-file"],
+                    "display-tracking-id": tracker_values.getint(
+                        "display-tracking-id"
+                    ),
+                    "enable-batch-process": tracker_values.getint(
+                        "enable-batch-process"
+                    ),
+                    "enable-past-frame": tracker_values.getint(
+                        "enable-past-frame"
+                    ),
+                }
+                for name, value in tracker_properties.items():
+                    self._set_if_supported(tracker, name, value)
+                pipeline.add(tracker)
+                self._link_many([streammux, person_infer, tracker])
+            else:
+                self._link_many([streammux, person_infer])
             infer_src = person_infer.get_static_pad("src")
             if infer_src is None:
                 raise RuntimeError("Could not get person nvinfer src pad")
@@ -2260,14 +2263,18 @@ class LowLatencyDeepStreamPublisher:
                 Gst.PadProbeType.BUFFER,
                 self._pose_tensor_probe,
             )
-            tracker_src = tracker.get_static_pad("src")
-            if tracker_src is None:
-                raise RuntimeError("Could not get NvDCF tracker src pad")
-            tracker_src.add_probe(
+            metadata_src = (
+                tracker.get_static_pad("src")
+                if tracker is not None
+                else infer_src
+            )
+            if metadata_src is None:
+                raise RuntimeError("Could not get AI metadata src pad")
+            metadata_src.add_probe(
                 Gst.PadProbeType.BUFFER,
                 self._ai_metadata_probe,
             )
-            analytics_tail = tracker
+            analytics_tail = tracker or person_infer
 
         if self._ai_enabled:
             batch_tee = self._make("tee", "post-tracker-batch-tee")
@@ -2345,8 +2352,20 @@ class LowLatencyDeepStreamPublisher:
             if uri.lower().startswith("file://"):
                 pacer = self._make("identity", f"source-pacer-{index:02d}")
                 self._set_if_supported(pacer, "sync", True)
-                self._set_if_supported(pacer, "single-segment", True)
                 pipeline.add(pacer)
+                source_pad = source_bin.get_static_pad("src")
+                if source_pad is None:
+                    raise RuntimeError(
+                        f"File source {index} has no pacing pad"
+                    )
+                # A seek loop resets file PTS to zero. Rewrite it to the
+                # pipeline running time before identity schedules the buffer;
+                # otherwise nvtracker receives a backwards timeline and can
+                # crash after the first loop.
+                source_pad.add_probe(
+                    Gst.PadProbeType.BUFFER,
+                    self._fullscreen_retimestamp_probe,
+                )
                 if not source_bin.link(pacer) or not pacer.link(tee):
                     raise RuntimeError(
                         f"Could not link paced source {index} to tee"
@@ -2520,8 +2539,8 @@ class LowLatencyDeepStreamPublisher:
             return
 
         # Mosaic layout.
-        rows = int(os.getenv("WALL_ROWS", "4"))
-        columns = int(os.getenv("WALL_COLUMNS", "6"))
+        configured_columns = int(os.getenv("WALL_COLUMNS", "6"))
+        rows, columns = wall_layout(number_sources, configured_columns)
 
         tiler.set_property("rows", rows)
         tiler.set_property("columns", columns)
@@ -2597,7 +2616,7 @@ class LowLatencyDeepStreamPublisher:
         self._configure_rtsp_publisher(
             publisher,
             self.settings.publish_url,
-            False,
+            True,
         )
 
         elements = [
@@ -2899,12 +2918,16 @@ def parse_args() -> Settings:
             for item in os.getenv("STATIC_CAMERA_EXCLUDE", "").split(",")
             if item.strip()
         }
+        minimum_static_bytes = int(
+            os.getenv("STATIC_CAMERA_MIN_BYTES", "0")
+        )
         video_paths = sorted(
             (
                 path
                 for path in folder.rglob("*")
                 if path.is_file()
                 and path.suffix.lower() in supported
+                and path.stat().st_size >= minimum_static_bytes
                 and str(path.relative_to(folder)).replace(
                     "\\", "/"
                 ).lower() not in excluded_static_paths

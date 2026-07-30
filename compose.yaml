@@ -39,24 +39,26 @@ services:
     ipc: host
     environment:
       PYTHONDONTWRITEBYTECODE: "1"
-      RTSP_CAMERA_LIMIT: "8"
-      RTSP_CAMERA_COPIES: "3"
+      RTSP_CAMERA_LIMIT: "0"
+      RTSP_CAMERA_COPIES: "1"
       RTSP_SHARED_INGEST: "false"
-      STATIC_CAMERA_LIMIT: "0"
-      STATIC_CAMERA_SOURCE_COUNT: "0"
+      STATIC_CAMERA_LIMIT: "6"
+      STATIC_CAMERA_SOURCE_COUNT: "6"
       STATIC_CAMERA_EMULATION: "false"
+      STATIC_CAMERA_EXCLUDE: "2.mp4"
+      STATIC_CAMERA_MIN_BYTES: "20000000"
       STATIC_CAMERA_PASSTHROUGH: "false"
       VIDEO_ONLY_MODE: "false"
       VIDEO_STREAM_ON_DEMAND: "true"
       VIDEO_TRANSPORT_BACKEND: "webrtc"
       VIDEO_ENCODER_BACKEND: "nvenc"
-      AI_ENABLED: "true"
-      AI_STREAM_ENABLED: "true"
-      AI_PERSON_DETECTOR_ENABLED: "true"
+      AI_ENABLED: "false"
+      AI_STREAM_ENABLED: "false"
+      AI_PERSON_DETECTOR_ENABLED: "false"
       AI_PERSON_INPUT_WIDTH: "640"
       AI_PERSON_INPUT_HEIGHT: "640"
       AI_PERSON_BACKEND: "tensorrt"
-      AI_TRACKER_ENABLED: "true"
+      AI_TRACKER_ENABLED: "false"
       AI_TRACKER_BACKEND: "nvtracker"
       PERSON_TRACK_END_TIMEOUT_MS: "1500"
       PERSON_TRACK_MAX_CANDIDATES: "8"
@@ -64,7 +66,7 @@ services:
       AI_FULL_FRAME_CPU_COPY_ALLOWED: "false"
       REDIS_STREAM_ENABLED: "true"
       MINIO_MEDIA_ENABLED: "true"
-      GPU_SNAPSHOT_ENABLED: "false"
+      GPU_SNAPSHOT_ENABLED: "true"
       AI_OVERLAY_ENABLED: "false"
       AI_OVERLAY_DEFAULT_ENABLED: "true"
       AI_OVERLAY_SHOW_TRACK_ID: "true"
@@ -79,15 +81,15 @@ services:
       CPU_PRESENTATION_ENABLED: "false"
       MOSAIC_PUBLISH_ENABLED: "true"
       INDIVIDUAL_STREAMS_ENABLED: "false"
-      WALL_COLUMNS: "6"
-      WALL_ROWS: "4"
+      WALL_COLUMNS: "3"
+      WALL_ROWS: "2"
       WALL_TARGET_FPS: "12"
       FULLSCREEN_OUTPUT_WIDTH: "2944"
       FULLSCREEN_OUTPUT_HEIGHT: "1664"
       INDIVIDUAL_OUTPUT_WIDTH: "1280"
       INDIVIDUAL_OUTPUT_HEIGHT: "720"
       BENCHMARK_PIPELINE_MODE: "full"
-      BENCHMARK_STATIC_ONLY: "false"
+      BENCHMARK_STATIC_ONLY: "true"
     depends_on:
       - mediamtx
       - redis
@@ -102,8 +104,9 @@ services:
       - deepstream_low_latency_rtsp_and_file.py
       - --publish-url
       - rtsp://mediamtx:8554/deepstream-mosaic
-      - --camera-config
-      - /workspace/camera_sources.local.json
+      - --video-folder
+      - /workspace/data
+      - --loop-files
       - --transport
       - tcp
       - --rtsp-latency

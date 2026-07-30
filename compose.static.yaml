@@ -1,16 +1,21 @@
 services:
   deepstream:
     environment:
+      AI_ENABLED: "false"
+      AI_STREAM_ENABLED: "false"
+      AI_PERSON_DETECTOR_ENABLED: "false"
+      AI_TRACKER_ENABLED: "false"
       # Static-only mode prevents camera_sources.local.json from being loaded,
       # so no RTSP camera address is contacted in this mode.
       BENCHMARK_STATIC_ONLY: "true"
       # uridecodebin + the app's explicit EOS seek loop is stable on this
       # DeepStream build. nvurisrcbin file-loop causes segment-order warnings.
       STATIC_CAMERA_EMULATION: "false"
-      STATIC_CAMERA_LIMIT: "12"
-      STATIC_CAMERA_SOURCE_COUNT: "12"
-      WALL_COLUMNS: "4"
-      WALL_ROWS: "3"
+      STATIC_CAMERA_LIMIT: "6"
+      STATIC_CAMERA_SOURCE_COUNT: "6"
+      STATIC_CAMERA_MIN_BYTES: "20000000"
+      WALL_COLUMNS: "3"
+      WALL_ROWS: "2"
       STATIC_CAMERA_PASSTHROUGH: "false"
       # MPEG-4 Part 2 data/2.mp4 does not reliably seek-loop; the next MP4 in
       # the deterministic list replaces it while the camera count stays 24.
