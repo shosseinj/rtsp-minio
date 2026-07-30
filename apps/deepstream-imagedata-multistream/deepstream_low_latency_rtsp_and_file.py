@@ -142,6 +142,11 @@ class LowLatencyDeepStreamPublisher:
         self._web_server: Any = None
         self._web_thread: threading.Thread | None = None
         self._loop_restarts_pending: set[str] = set()
+        self._decoder_names_by_source: dict[int, set[str]] = {
+            index: set() for index in range(len(settings.uris))
+        }
+        self._osd_diagnostic_frames = 0
+        self._file_pts_state: dict[int, dict[str, int]] = {}
         self._file_publisher_stop = threading.Event()
         self._file_publisher_processes: list[subprocess.Popen[Any]] = []
         self._file_publisher_threads: list[threading.Thread] = []
@@ -503,6 +508,20 @@ class LowLatencyDeepStreamPublisher:
 
         # Keep decoded surfaces in CUDA device memory.
         if "nvv4l2decoder" in lower_name:
+            source_index = int(source_context["source_index"])
+            decoder_names = self._decoder_names_by_source[source_index]
+            decoder_names.add(child.get_name())
+            total_decoders = sum(
+                len(items) for items in self._decoder_names_by_source.values()
+            )
+            print(
+                "DECODER source_id="
+                f"{source_context['source_id']} source_uri="
+                f"{source_context['safe_uri']} decoder_element_name="
+                f"{child.get_name()} decoder_count_for_source="
+                f"{len(decoder_names)} total_decoder_count={total_decoders}",
+                flush=True,
+            )
             self._set_if_supported(
                 child,
                 "cudadec-memtype",
@@ -564,6 +583,36 @@ class LowLatencyDeepStreamPublisher:
         )
         buffer.pts = running_time
         buffer.dts = running_time
+        return Gst.PadProbeReturn.OK
+
+    def _file_pts_rebase_probe(
+        self,
+        _pad: Gst.Pad,
+        info: Gst.PadProbeInfo,
+        source_index: int,
+    ) -> Gst.PadProbeReturn:
+        """Preserve media pacing and make seek-loop PTS monotonic."""
+        buffer = info.get_buffer()
+        if buffer is None or buffer.pts == Gst.CLOCK_TIME_NONE:
+            return Gst.PadProbeReturn.OK
+        raw_pts = int(buffer.pts)
+        state = self._file_pts_state.setdefault(
+            source_index,
+            {"raw_last": -1, "out_last": -1, "offset": 0, "step": 1},
+        )
+        if state["raw_last"] >= 0:
+            raw_step = raw_pts - state["raw_last"]
+            if raw_step > 0:
+                state["step"] = raw_step
+            elif raw_pts < state["raw_last"]:
+                state["offset"] = (
+                    state["out_last"] + state["step"] - raw_pts
+                )
+        output_pts = raw_pts + state["offset"]
+        buffer.pts = output_pts
+        buffer.dts = output_pts
+        state["raw_last"] = raw_pts
+        state["out_last"] = output_pts
         return Gst.PadProbeReturn.OK
 
     def _wall_rate_limit_probe(
@@ -906,7 +955,7 @@ class LowLatencyDeepStreamPublisher:
                             float(self._fullscreen_stats["fps"]), 1
                         ),
                         "frames": int(self._fullscreen_stats["frames"]),
-                        "active": self._fullscreen_branch is not None,
+                        "active": self._fullscreen_state == "ACTIVE",
                     },
                     "fullscreen_controller": {
                         "state": self._fullscreen_state,
@@ -1147,13 +1196,13 @@ class LowLatencyDeepStreamPublisher:
             GLib.idle_add(self._stop_fullscreen_branch)
             deadline = time.monotonic() + 4.0
             while (
-                self._fullscreen_branch is not None
+                self._fullscreen_state != "IDLE"
                 and time.monotonic() < deadline
             ):
                 time.sleep(0.05)
-            if self._fullscreen_branch is not None:
+            if self._fullscreen_state != "IDLE":
                 return {"error": "fullscreen release timeout"}, 504
-            return {"status": "stopped", "encoder": "released"}, 200
+            return {"status": "stopped", "encoder": "warm"}, 200
 
         @app.get("/api/fullscreen/status")
         def fullscreen_status() -> Any:
@@ -1371,6 +1420,21 @@ class LowLatencyDeepStreamPublisher:
         source_context = {
             "source_bin": source_bin,
             "is_live": is_rtsp,
+            "source_index": index,
+            "source_id": next(
+                (
+                    str(camera["camera_id"])
+                    for camera in self.settings.cameras
+                    if int(camera["source_index"]) == index
+                ),
+                f"source-{index:03d}",
+            ),
+            "safe_uri": (
+                f"{urlsplit(uri).scheme}://{urlsplit(uri).hostname or ''}"
+                f"{urlsplit(uri).path}"
+                if is_rtsp
+                else uri
+            ),
         }
 
         decodebin.connect(
@@ -1424,6 +1488,65 @@ class LowLatencyDeepStreamPublisher:
                 )
                 self._wall_stats["window_frames"] = 0
                 self._wall_stats["window_started"] = now
+        return Gst.PadProbeReturn.OK
+
+    def _osd_input_diagnostic_probe(
+        self,
+        pad: Gst.Pad,
+        info: Gst.PadProbeInfo,
+    ) -> Gst.PadProbeReturn:
+        """Rate-limited proof that object metadata reaches nvdsosd."""
+        buffer = info.get_buffer()
+        if buffer is None:
+            return Gst.PadProbeReturn.OK
+        self._osd_diagnostic_frames += 1
+        if self._osd_diagnostic_frames % 100 != 0:
+            return Gst.PadProbeReturn.OK
+        import pyds
+
+        batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(buffer))
+        if batch_meta is None:
+            return Gst.PadProbeReturn.OK
+        object_count = 0
+        source_ids: list[str] = []
+        frame_num = -1
+        frame_list = batch_meta.frame_meta_list
+        while frame_list is not None:
+            frame_meta = pyds.NvDsFrameMeta.cast(frame_list.data)
+            source_index = int(frame_meta.pad_index)
+            frame_num = max(frame_num, int(frame_meta.frame_num))
+            source_ids.append(
+                next(
+                    (
+                        str(camera["camera_id"])
+                        for camera in self.settings.cameras
+                        if int(camera["source_index"]) == source_index
+                    ),
+                    str(source_index),
+                )
+            )
+            obj_list = frame_meta.obj_meta_list
+            while obj_list is not None:
+                object_count += 1
+                try:
+                    obj_list = obj_list.next
+                except StopIteration:
+                    break
+            try:
+                frame_list = frame_list.next
+            except StopIteration:
+                break
+        caps = pad.get_current_caps()
+        osd_format = "unknown"
+        if caps is not None and caps.get_size() > 0:
+            structure = caps.get_structure(0)
+            osd_format = str(structure.get_value("format") or "unknown")
+        print(
+            f"OSD_INPUT frame_num={frame_num} source_ids="
+            f"{','.join(source_ids)} object_count={object_count} "
+            f"osd_input_format={osd_format}",
+            flush=True,
+        )
         return Gst.PadProbeReturn.OK
 
     def _append_track_event(self, track: dict[str, Any]) -> None:
@@ -1681,81 +1804,6 @@ class LowLatencyDeepStreamPublisher:
             self._ai_stats["ai_frames_received"] += 1
             self._ai_stats["ai_frames_resized_gpu"] += 1
             self._ai_stats["window_frames"] += 1
-            pose_rows: list[dict[str, Any]] = []
-            user_list = frame_meta.frame_user_meta_list
-            while user_list is not None:
-                try:
-                    user_meta = pyds.NvDsUserMeta.cast(user_list.data)
-                except StopIteration:
-                    break
-                if (
-                    user_meta.base_meta.meta_type
-                    == pyds.NvDsMetaType.NVDSINFER_TENSOR_OUTPUT_META
-                ):
-                    tensor_meta = pyds.NvDsInferTensorMeta.cast(
-                        user_meta.user_meta_data
-                    )
-                    for layer_index in range(
-                        int(tensor_meta.num_output_layers)
-                    ):
-                        layer = tensor_meta.output_layers_info(layer_index)
-                        if str(layer.layerName or "") != "output0":
-                            continue
-                        dims = layer.inferDims
-                        shape = [
-                            int(dims.d[index])
-                            for index in range(int(dims.numDims))
-                        ]
-                        if shape != [300, 57]:
-                            continue
-                        try:
-                            address = pyds.get_ptr(layer.buffer)
-                        except (TypeError, ValueError):
-                            continue
-                        if address == 0:
-                            continue
-                        try:
-                            values = ctypes.cast(
-                                address,
-                                ctypes.POINTER(ctypes.c_float * (300 * 57)),
-                            ).contents
-                        except (TypeError, ValueError):
-                            continue
-                        for row_index in range(300):
-                            offset = row_index * 57
-                            confidence = float(values[offset + 4])
-                            class_id = int(round(float(values[offset + 5])))
-                            if confidence < 0.25 or class_id != 0:
-                                continue
-                            keypoints = [
-                                {
-                                    "x": float(values[offset + 6 + kp * 3]),
-                                    "y": float(values[offset + 7 + kp * 3]),
-                                    "confidence": float(
-                                        values[offset + 8 + kp * 3]
-                                    ),
-                                }
-                                for kp in range(17)
-                            ]
-                            pose_rows.append(
-                                {
-                                    "bbox_640": [
-                                        float(values[offset]),
-                                        float(values[offset + 1]),
-                                        float(values[offset + 2]),
-                                        float(values[offset + 3]),
-                                    ],
-                                    "confidence": confidence,
-                                    "keypoints": keypoints,
-                                }
-                            )
-                            self._ai_stats[
-                                "pose_keypoints_extracted_total"
-                            ] += 17
-                try:
-                    user_list = user_list.next
-                except StopIteration:
-                    break
             obj_list = frame_meta.obj_meta_list
             object_index = 0
             while obj_list is not None:
@@ -1833,13 +1881,6 @@ class LowLatencyDeepStreamPublisher:
                                 * max(float(obj.confidence), 0.0)
                             ),
                         }
-                        if object_index < len(pose_rows):
-                            candidate["bbox_640"] = pose_rows[object_index][
-                                "bbox_640"
-                            ]
-                            candidate["keypoints_640"] = pose_rows[
-                                object_index
-                            ]["keypoints"]
                         if self._obj_encoder_context is not None:
                             encode_args = pyds.NvDsObjEncUsrArgs()
                             encode_args.saveImg = False
@@ -1923,6 +1964,74 @@ class LowLatencyDeepStreamPublisher:
         self._ai_stats["track_candidate_count"] = sum(
             len(track["candidates"]) for track in self._person_tracks.values()
         )
+        return Gst.PadProbeReturn.OK
+
+    def _overlay_metadata_probe(
+        self,
+        _pad: Gst.Pad,
+        info: Gst.PadProbeInfo,
+    ) -> Gst.PadProbeReturn:
+        """Mutate only standard object metadata used by nvdsosd."""
+        buffer = info.get_buffer()
+        if buffer is None:
+            return Gst.PadProbeReturn.OK
+        import pyds
+
+        batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(buffer))
+        if batch_meta is None:
+            return Gst.PadProbeReturn.OK
+        frame_list = batch_meta.frame_meta_list
+        while frame_list is not None:
+            frame_meta = pyds.NvDsFrameMeta.cast(frame_list.data)
+            source_index = int(frame_meta.pad_index)
+            source_id = next(
+                (
+                    str(camera["camera_id"])
+                    for camera in self.settings.cameras
+                    if int(camera["source_index"]) == source_index
+                ),
+                str(source_index),
+            )
+            enabled = self._overlay_per_camera.get(source_id)
+            if enabled is None:
+                enabled = self._overlay_global
+            obj_list = frame_meta.obj_meta_list
+            while obj_list is not None:
+                obj = pyds.NvDsObjectMeta.cast(obj_list.data)
+                if int(obj.class_id) == 0:
+                    if enabled:
+                        confidence = max(
+                            float(obj.confidence),
+                            float(getattr(obj, "tracker_confidence", 0.0)),
+                        )
+                        obj.rect_params.border_width = 3
+                        obj.rect_params.border_color.set(0.0, 1.0, 0.0, 1.0)
+                        obj.text_params.display_text = (
+                            f"Person | ID: {int(obj.object_id)} | "
+                            f"{confidence:.2f}"
+                        )
+                        obj.text_params.font_params.font_name = "Serif"
+                        obj.text_params.font_params.font_size = 12
+                        obj.text_params.font_params.font_color.set(
+                            1.0, 1.0, 1.0, 1.0
+                        )
+                        obj.text_params.set_bg_clr = 1
+                        obj.text_params.text_bg_clr.set(
+                            0.0, 0.0, 0.0, 0.7
+                        )
+                        self._overlay_stats["overlay_frames_rendered"] += 1
+                        self._ai_stats["person_detections_total"] += 1
+                    else:
+                        obj.rect_params.border_width = 0
+                        obj.text_params.display_text = ""
+                try:
+                    obj_list = obj_list.next
+                except StopIteration:
+                    break
+            try:
+                frame_list = frame_list.next
+            except StopIteration:
+                break
         return Gst.PadProbeReturn.OK
 
     def _pose_tensor_probe(
@@ -2259,10 +2368,6 @@ class LowLatencyDeepStreamPublisher:
             infer_src = person_infer.get_static_pad("src")
             if infer_src is None:
                 raise RuntimeError("Could not get person nvinfer src pad")
-            infer_src.add_probe(
-                Gst.PadProbeType.BUFFER,
-                self._pose_tensor_probe,
-            )
             metadata_src = (
                 tracker.get_static_pad("src")
                 if tracker is not None
@@ -2270,9 +2375,12 @@ class LowLatencyDeepStreamPublisher:
             )
             if metadata_src is None:
                 raise RuntimeError("Could not get AI metadata src pad")
+            # Keep the rendering path on standard NvDsObjectMeta. The older
+            # event probe also dereferenced/copied auxiliary metadata and can
+            # crash the native pipeline; a rendering-only probe is used below.
             metadata_src.add_probe(
                 Gst.PadProbeType.BUFFER,
-                self._ai_metadata_probe,
+                self._overlay_metadata_probe,
             )
             analytics_tail = tracker or person_infer
 
@@ -2364,7 +2472,8 @@ class LowLatencyDeepStreamPublisher:
                 # crash after the first loop.
                 source_pad.add_probe(
                     Gst.PadProbeType.BUFFER,
-                    self._fullscreen_retimestamp_probe,
+                    self._file_pts_rebase_probe,
+                    index,
                 )
                 if not source_bin.link(pacer) or not pacer.link(tee):
                     raise RuntimeError(
@@ -2573,6 +2682,8 @@ class LowLatencyDeepStreamPublisher:
 
         self._set_if_supported(osd, "gpu-id", self.settings.gpu_id)
         self._set_if_supported(osd, "process-mode", 1)
+        self._set_if_supported(osd, "display-bbox", True)
+        self._set_if_supported(osd, "display-text", True)
 
         self._configure_leaky_queue(output_queue)
         output_src_pad = output_queue.get_static_pad("src")
@@ -2636,6 +2747,14 @@ class LowLatencyDeepStreamPublisher:
             pipeline.add(element)
 
         self._link_many([analytics_tail, *elements])
+
+        osd_input_pad = rgba_capsfilter.get_static_pad("src")
+        if osd_input_pad is None:
+            raise RuntimeError("Could not get nvdsosd input pad")
+        osd_input_pad.add_probe(
+            Gst.PadProbeType.BUFFER,
+            self._osd_input_diagnostic_probe,
+        )
 
         # Count the frames actually delivered by the single Wall NVENC path.
         wall_encoded_pad = parser.get_static_pad("src")

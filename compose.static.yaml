@@ -1,10 +1,10 @@
 services:
   deepstream:
     environment:
-      AI_ENABLED: "false"
-      AI_STREAM_ENABLED: "false"
-      AI_PERSON_DETECTOR_ENABLED: "false"
-      AI_TRACKER_ENABLED: "false"
+      AI_ENABLED: "true"
+      AI_STREAM_ENABLED: "true"
+      AI_PERSON_DETECTOR_ENABLED: "true"
+      AI_TRACKER_ENABLED: "true"
       # Static-only mode prevents camera_sources.local.json from being loaded,
       # so no RTSP camera address is contacted in this mode.
       BENCHMARK_STATIC_ONLY: "true"
